@@ -398,6 +398,17 @@ autosave path - it covers the regressions that are easy to reintroduce:
 `load_test.py` prints the numbers quoted under **Performance notes** so you can
 confirm them on your own hardware.
 
+### History
+
+The repository starts with a snapshot of the source as it stood before the
+performance rewrite, so the change is diffable and revertable:
+
+```bash
+git log --oneline                       # two commits: snapshot, then the rewrite
+git diff HEAD~1 HEAD -- main_window.py  # what changed in the window
+git show HEAD~1:widgets/image_queue.py  # the original file, in full
+```
+
 ---
 
 ## Config location
