@@ -1,55 +1,39 @@
 """
 SnP Image Labeler - Image Queue Panel
-Left panel with:
-  - Background thumbnail loading (QImage in thread → QPixmap in main thread)
-  - Green/grey label-status indicators
-  - Right-click context menu: Remove from Queue / Delete Image
-  - Clear All button in header
+
+Built for long queues:
+  - thumbnails are requested only for the rows in (and just around) the
+    viewport, decoded scaled on a small thread pool and cached on disk
+  - row lookup is a dict, not a scan of every item, so delivering a
+    thumbnail or marking an image done is O(1) instead of O(n)
+  - the done/pending/flagged counters are kept incrementally
+  - three states, not two: pending, done, and "flagged for review"
 """
 
-from pathlib import Path
-from typing import Callable, List, Optional
+import os
+from typing import Callable, Dict, List, Optional
 
-from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QIcon, QPixmap, QColor, QImage
+from PyQt5.QtCore import QPoint, QSize, Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QColor, QIcon, QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMenu, QPushButton, QVBoxLayout, QWidget,
+    QComboBox, QFrame, QHBoxLayout, QLabel, QListView, QListWidget,
+    QListWidgetItem, QMenu, QPushButton, QVBoxLayout, QWidget,
 )
 
+from core.thumbnail_cache import ThumbnailService
 
-# ------------------------------------------------------------------ #
-#  Background thumbnail loader — uses QImage (thread-safe)            #
-# ------------------------------------------------------------------ #
+# Row states
+PENDING = 0
+DONE    = 1
+FLAGGED = 2
 
-class ThumbnailLoader(QThread):
-    thumbnail_ready = pyqtSignal(str, QImage)
-    SIZE = 56
+FILTER_ALL     = "All"
+FILTER_PENDING = "Pending"
+FILTER_DONE    = "Done"
+FILTER_FLAGGED = "Flagged"
 
-    def __init__(self, paths: List[str], parent=None, size: Optional[int] = None):
-        super().__init__(parent)
-        self._paths     = list(paths)
-        self._size      = size or self.SIZE
-        self._cancelled = False
-
-    def run(self):
-        for path in self._paths:
-            if self._cancelled:
-                break
-            try:
-                img = QImage(path)
-                if not img.isNull():
-                    thumb = img.scaled(
-                        self._size, self._size,
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation,
-                    )
-                    self.thumbnail_ready.emit(path, thumb)
-            except Exception:
-                pass
-
-    def cancel(self):
-        self._cancelled = True
+THUMB_SIZE   = 56
+VIEW_MARGIN  = 12          # rows fetched above/below the viewport
 
 
 # ------------------------------------------------------------------ #
@@ -57,18 +41,15 @@ class ThumbnailLoader(QThread):
 # ------------------------------------------------------------------ #
 
 class ImageQueueItem(QListWidgetItem):
-    def __init__(
-        self,
-        image_path: str,
-        labeled: bool = False,
-        done_word: str = "Labeled",
-        pending_word: str = "Pending",
-    ):
+    def __init__(self, image_path: str, state: int = PENDING,
+                 done_word: str = "Labeled", pending_word: str = "Pending"):
         super().__init__()
         self.image_path    = image_path
-        self._labeled      = labeled
+        self.orig_size: Optional[QSize] = None
+        self._state        = state
         self._done_word    = done_word
         self._pending_word = pending_word
+        self._name         = os.path.basename(image_path)
         self.setSizeHint(QSize(190, 68))
         self._refresh_text()
 
@@ -78,27 +59,40 @@ class ImageQueueItem(QListWidgetItem):
         self._refresh_text()
 
     def _refresh_text(self):
-        name = Path(self.image_path).name
+        name = self._name
         if len(name) > 22:
             name = name[:19] + "..."
-        status = (f"✓ {self._done_word}" if self._labeled
-                  else f"○ {self._pending_word}")
+        if self._state == DONE:
+            status, color = f"✓ {self._done_word}", "#a6e3a1"
+        elif self._state == FLAGGED:
+            status, color = "⚑ Review", "#f9e2af"
+        else:
+            status, color = f"○ {self._pending_word}", "#a6adc8"
         self.setText(f"{name}\n{status}")
-        self.setForeground(
-            QColor("#a6e3a1") if self._labeled else QColor("#a6adc8")
-        )
+        self.setForeground(QColor(color))
+        self.setToolTip(self.image_path)
 
     def set_thumbnail(self, image: QImage):
         self.setIcon(QIcon(QPixmap.fromImage(image)))
 
-    def set_labeled(self, labeled: bool):
-        if self._labeled != labeled:
-            self._labeled = labeled
-            self._refresh_text()
+    def set_state(self, state: int) -> bool:
+        if self._state == state:
+            return False
+        self._state = state
+        self._refresh_text()
+        return True
+
+    @property
+    def state(self) -> int:
+        return self._state
 
     @property
     def is_labeled(self) -> bool:
-        return self._labeled
+        return self._state == DONE
+
+    @property
+    def is_flagged(self) -> bool:
+        return self._state == FLAGGED
 
 
 # ------------------------------------------------------------------ #
@@ -107,17 +101,28 @@ class ImageQueueItem(QListWidgetItem):
 
 class ImageQueuePanel(QWidget):
     image_selected      = pyqtSignal(str, int)   # (path, index)
-    remove_requested    = pyqtSignal(str)         # path to remove
-    delete_requested    = pyqtSignal(str)         # path to move to _rejected
+    remove_requested    = pyqtSignal(str)
+    delete_requested    = pyqtSignal(str)
+    flag_requested      = pyqtSignal(str)
     clear_all_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._image_paths: List[str]           = []
-        self._loaders:     List[ThumbnailLoader] = []
+        self._image_paths: List[str] = []
+        self._rows: Dict[str, ImageQueueItem] = {}
         self._done_word    = "Labeled"
         self._pending_word = "Pending"
-        self._pending_only = False
+        self._filter       = FILTER_ALL
+        self._n_done       = 0
+        self._n_flagged    = 0
+
+        self._thumbs = ThumbnailService(THUMB_SIZE, "queue", self)
+        self._thumbs.thumbnail_ready.connect(self._on_thumbnail_ready)
+
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setSingleShot(True)
+        self._thumb_timer.timeout.connect(self._request_visible_thumbnails)
+
         self._setup_ui()
 
     # ------------------------------------------------------------------ #
@@ -129,7 +134,6 @@ class ImageQueuePanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Header row with title + Clear button
         hdr_frame = QFrame()
         hdr_frame.setObjectName("queue_header_frame")
         hdr_layout = QHBoxLayout(hdr_frame)
@@ -147,10 +151,8 @@ class ImageQueuePanel(QWidget):
         self._btn_clear.setEnabled(False)
         self._btn_clear.clicked.connect(lambda _: self.clear_all_requested.emit())
         hdr_layout.addWidget(self._btn_clear)
-
         layout.addWidget(hdr_frame)
 
-        # Count bar with "pending only" filter
         count_frame = QFrame()
         count_frame.setObjectName("count_frame")
         cf = QHBoxLayout(count_frame)
@@ -162,24 +164,33 @@ class ImageQueuePanel(QWidget):
         self._count_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         cf.addWidget(self._count_label, 1)
 
-        self._btn_filter = QPushButton("Pending")
-        self._btn_filter.setObjectName("queue_filter_btn")
-        self._btn_filter.setCheckable(True)
-        self._btn_filter.setFixedHeight(22)
-        self._btn_filter.setToolTip("Show only images that still need work")
-        self._btn_filter.toggled.connect(self._on_filter_toggled)
-        cf.addWidget(self._btn_filter)
-
+        self._filter_combo = QComboBox()
+        self._filter_combo.setObjectName("queue_filter_combo")
+        self._filter_combo.addItems(
+            [FILTER_ALL, FILTER_PENDING, FILTER_DONE, FILTER_FLAGGED]
+        )
+        self._filter_combo.setFixedHeight(22)
+        self._filter_combo.setToolTip("Show only rows in this state")
+        self._filter_combo.currentTextChanged.connect(self._on_filter_changed)
+        cf.addWidget(self._filter_combo)
         layout.addWidget(count_frame)
 
-        # Image list with context menu
         self._list = QListWidget()
         self._list.setObjectName("image_list")
-        self._list.setIconSize(QSize(56, 56))
+        self._list.setIconSize(QSize(THUMB_SIZE, THUMB_SIZE))
         self._list.setSpacing(1)
+        # Long-queue settings: uniform rows let the view lay out 50k items
+        # without measuring each one, and batched layout keeps it responsive.
+        self._list.setUniformItemSizes(True)
+        self._list.setLayoutMode(QListView.Batched)
+        self._list.setBatchSize(120)
+        self._list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self._list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list.currentRowChanged.connect(self._on_row_changed)
         self._list.customContextMenuRequested.connect(self._show_context_menu)
+        self._list.verticalScrollBar().valueChanged.connect(
+            lambda _: self._thumb_timer.start(50)
+        )
         layout.addWidget(self._list)
 
     # ------------------------------------------------------------------ #
@@ -191,6 +202,11 @@ class ImageQueuePanel(QWidget):
         if not isinstance(item, ImageQueueItem):
             return
         menu = QMenu(self)
+        act_flag = menu.addAction(
+            "Unflag" if item.is_flagged else "Flag for Review"
+        )
+        act_flag.setToolTip("Mark it to come back to later  (Ctrl+F)")
+        menu.addSeparator()
         act_remove = menu.addAction("Remove from Queue")
         act_remove.setToolTip("Take it out of this session. The file is not touched.")
         act_delete = menu.addAction("Delete Image…")
@@ -198,7 +214,9 @@ class ImageQueuePanel(QWidget):
             "Move the file into the _rejected folder and drop it from the dataset."
         )
         chosen = menu.exec_(self._list.mapToGlobal(pos))
-        if chosen == act_remove:
+        if chosen == act_flag:
+            self.flag_requested.emit(item.image_path)
+        elif chosen == act_remove:
             self.remove_requested.emit(item.image_path)
         elif chosen == act_delete:
             self.delete_requested.emit(item.image_path)
@@ -207,109 +225,163 @@ class ImageQueuePanel(QWidget):
     #  Public API                                                          #
     # ------------------------------------------------------------------ #
 
-    def load_images(
-        self,
-        paths: List[str],
-        label_checker: Optional[Callable[[str], bool]] = None,
-    ):
-        self._stop_all_loaders()
+    def load_images(self, paths: List[str],
+                    state_checker: Optional[Callable[[str], int]] = None):
+        self._thumbs.cancel_pending()
         self._list.clear()
+        self._rows.clear()
         self._image_paths = list(paths)
-
-        for path in paths:
-            labeled = label_checker(path) if label_checker else False
-            self._list.addItem(
-                ImageQueueItem(path, labeled, self._done_word, self._pending_word)
-            )
-
+        self._n_done = self._n_flagged = 0
+        self._append_items(paths, state_checker)
         self._apply_filter()
         self._update_count()
-        self._start_thumbnail_loader(paths)
         self._btn_clear.setEnabled(bool(paths))
+        self._thumb_timer.start(0)
 
-    def add_images(
-        self,
-        paths: List[str],
-        label_checker: Optional[Callable[[str], bool]] = None,
-    ):
-        self._image_paths.extend(paths)
-        for path in paths:
-            labeled = label_checker(path) if label_checker else False
-            self._list.addItem(
-                ImageQueueItem(path, labeled, self._done_word, self._pending_word)
-            )
+    def add_images(self, paths: List[str],
+                   state_checker: Optional[Callable[[str], int]] = None):
+        new = [p for p in paths if p not in self._rows]
+        self._image_paths.extend(new)
+        self._append_items(new, state_checker)
         self._apply_filter()
         self._update_count()
-        self._start_thumbnail_loader(paths)
         self._btn_clear.setEnabled(True)
+        self._thumb_timer.start(0)
+
+    def _append_items(self, paths: List[str],
+                      state_checker: Optional[Callable[[str], int]]):
+        self._list.setUpdatesEnabled(False)
+        try:
+            for path in paths:
+                state = state_checker(path) if state_checker else PENDING
+                item = ImageQueueItem(path, state, self._done_word,
+                                      self._pending_word)
+                self._list.addItem(item)
+                self._rows[path] = item
+                if state == DONE:
+                    self._n_done += 1
+                elif state == FLAGGED:
+                    self._n_flagged += 1
+        finally:
+            self._list.setUpdatesEnabled(True)
 
     def remove_image(self, path: str) -> int:
-        """
-        Remove one image from the queue.
-        Returns the row index that was removed (-1 if not found).
-        """
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if isinstance(item, ImageQueueItem) and item.image_path == path:
-                self._list.takeItem(i)
-                if path in self._image_paths:
-                    self._image_paths.remove(path)
-                self._update_count()
-                self._btn_clear.setEnabled(bool(self._image_paths))
-                return i
-        return -1
+        """Remove one image. Returns the row index removed, or -1."""
+        item = self._rows.pop(path, None)
+        if item is None:
+            return -1
+        row = self._list.row(item)
+        if item.state == DONE:
+            self._n_done -= 1
+        elif item.state == FLAGGED:
+            self._n_flagged -= 1
+        self._list.takeItem(row)
+        try:
+            self._image_paths.remove(path)
+        except ValueError:
+            pass
+        self._thumbs.forget(path)
+        self._update_count()
+        self._btn_clear.setEnabled(bool(self._image_paths))
+        return row
 
     def mark_labeled(self, path: str, labeled: bool = True):
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if isinstance(item, ImageQueueItem) and item.image_path == path:
-                item.set_labeled(labeled)
-                # Keep the row visible while it is the current one, even when
-                # the "Pending" filter is on — hiding it under the cursor is jarring.
-                if self._pending_only and labeled and i != self._list.currentRow():
-                    item.setHidden(True)
-                break
+        self.set_state(path, DONE if labeled else PENDING)
+
+    def set_flagged(self, path: str, flagged: bool):
+        item = self._rows.get(path)
+        if item is None:
+            return
+        if flagged:
+            self.set_state(path, FLAGGED)
+        elif item.state == FLAGGED:
+            self.set_state(path, PENDING)
+
+    def set_state(self, path: str, state: int):
+        item = self._rows.get(path)
+        if item is None:
+            return
+        old = item.state
+        if not item.set_state(state):
+            return
+        if old == DONE:
+            self._n_done -= 1
+        elif old == FLAGGED:
+            self._n_flagged -= 1
+        if state == DONE:
+            self._n_done += 1
+        elif state == FLAGGED:
+            self._n_flagged += 1
+        # Keep the row visible while it is the current one — hiding the row
+        # under the cursor is jarring. (Compared by identity: QListWidget.row()
+        # is a linear search and this runs on every save.)
+        if self._filter != FILTER_ALL and self._list.currentItem() is not item:
+            item.setHidden(not self._matches_filter(item))
         self._update_count()
 
+    def state_of(self, path: str) -> int:
+        item = self._rows.get(path)
+        return item.state if item else PENDING
+
     # ------------------------------------------------------------------ #
-    #  Task-aware status wording / re-evaluation                           #
+    #  Task-aware wording / bulk refresh                                   #
     # ------------------------------------------------------------------ #
 
     def set_status_labels(self, done_word: str, pending_word: str = "Pending"):
-        """Change the per-item wording (e.g. 'Labeled' vs 'Sorted')."""
         self._done_word    = done_word
         self._pending_word = pending_word
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if isinstance(item, ImageQueueItem):
-                item.set_status_words(done_word, pending_word)
+        for item in self._rows.values():
+            item.set_status_words(done_word, pending_word)
         self._update_count()
 
-    def refresh_status(self, checker: Optional[Callable[[str], bool]] = None):
-        """Re-evaluate every item's done/pending state with a new checker."""
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if isinstance(item, ImageQueueItem):
-                item.set_labeled(checker(item.image_path) if checker else False)
+    def refresh_status(self, checker: Optional[Callable[[str], int]] = None):
+        """Re-evaluate every row. `checker` returns PENDING/DONE/FLAGGED."""
+        self._n_done = self._n_flagged = 0
+        self._list.setUpdatesEnabled(False)
+        try:
+            for item in self._rows.values():
+                state = checker(item.image_path) if checker else PENDING
+                item.set_state(state)
+                if state == DONE:
+                    self._n_done += 1
+                elif state == FLAGGED:
+                    self._n_flagged += 1
+        finally:
+            self._list.setUpdatesEnabled(True)
         self._apply_filter()
         self._update_count()
 
     # ------------------------------------------------------------------ #
-    #  Pending filter                                                      #
+    #  Filtering                                                           #
     # ------------------------------------------------------------------ #
 
-    def _on_filter_toggled(self, checked: bool):
-        self._pending_only = checked
+    def _on_filter_changed(self, text: str):
+        self._filter = text
         self._apply_filter()
+        self._thumb_timer.start(0)
+
+    def _matches_filter(self, item: ImageQueueItem) -> bool:
+        if self._filter == FILTER_ALL:
+            return True
+        if self._filter == FILTER_PENDING:
+            return item.state == PENDING
+        if self._filter == FILTER_DONE:
+            return item.state == DONE
+        if self._filter == FILTER_FLAGGED:
+            return item.state == FLAGGED
+        return True
 
     def _apply_filter(self):
         current = self._list.currentRow()
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if not isinstance(item, ImageQueueItem):
-                continue
-            hide = self._pending_only and item.is_labeled and i != current
-            item.setHidden(hide)
+        self._list.setUpdatesEnabled(False)
+        try:
+            for i in range(self._list.count()):
+                item = self._list.item(i)
+                if not isinstance(item, ImageQueueItem):
+                    continue
+                item.setHidden(not (self._matches_filter(item) or i == current))
+        finally:
+            self._list.setUpdatesEnabled(True)
 
     def is_visible(self, index: int) -> bool:
         item = self._list.item(index)
@@ -327,19 +399,32 @@ class ImageQueuePanel(QWidget):
                 return i
         return -1
 
+    def index_of(self, path: str) -> int:
+        item = self._rows.get(path)
+        return self._list.row(item) if item is not None else -1
+
     def set_current_index(self, index: int):
         if 0 <= index < self._list.count():
             self._list.blockSignals(True)
             self._list.setCurrentRow(index)
             self._list.blockSignals(False)
+            item = self._list.item(index)
+            if item is not None:
+                if item.isHidden():
+                    item.setHidden(False)      # never strand the current row
+                self._list.scrollToItem(item, QListWidget.EnsureVisible)
+            self._thumb_timer.start(0)
 
     def current_index(self) -> int:
         return self._list.currentRow()
 
     def clear(self):
-        self._stop_all_loaders()
+        self._thumbs.cancel_pending()
+        self._thumbs.clear_memory()
         self._list.clear()
+        self._rows.clear()
         self._image_paths.clear()
+        self._n_done = self._n_flagged = 0
         self._update_count()
         self._btn_clear.setEnabled(False)
 
@@ -351,49 +436,84 @@ class ImageQueuePanel(QWidget):
     def count(self) -> int:
         return len(self._image_paths)
 
+    @property
+    def done_count(self) -> int:
+        return self._n_done
+
+    @property
+    def flagged_count(self) -> int:
+        return self._n_flagged
+
+    @property
+    def thumbnails(self) -> ThumbnailService:
+        return self._thumbs
+
+    def original_size(self, path: str) -> Optional[QSize]:
+        item = self._rows.get(path)
+        return item.orig_size if item else None
+
     # ------------------------------------------------------------------ #
     #  Internal                                                            #
     # ------------------------------------------------------------------ #
 
     def _on_row_changed(self, row: int):
-        if 0 <= row < len(self._image_paths):
-            self.image_selected.emit(self._image_paths[row], row)
+        item = self._list.item(row)
+        if isinstance(item, ImageQueueItem):
+            self.image_selected.emit(item.image_path, row)
 
-    @pyqtSlot(str, QImage)
-    def _on_thumbnail_ready(self, path: str, image: QImage):
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if isinstance(item, ImageQueueItem) and item.image_path == path:
-                item.set_thumbnail(image)
-                break
+    @pyqtSlot(str, QImage, QSize)
+    def _on_thumbnail_ready(self, path: str, image: QImage, size: QSize):
+        item = self._rows.get(path)          # O(1) — used to be a full scan
+        if item is not None:
+            item.set_thumbnail(image)
+            if size.isValid():
+                item.orig_size = size
 
     def _update_count(self):
-        total   = self._list.count()
-        labeled = sum(
-            1 for i in range(total)
-            if isinstance(self._list.item(i), ImageQueueItem)
-            and self._list.item(i).is_labeled
-        )
-        pending = total - labeled
-        self._count_label.setText(
-            f"{total} images  ·  {labeled} {self._done_word.lower()}  ·  {pending} pending"
-        )
+        total   = len(self._rows)
+        pending = total - self._n_done - self._n_flagged
+        text = (f"{total} images  ·  {self._n_done} {self._done_word.lower()}"
+                f"  ·  {pending} pending")
+        if self._n_flagged:
+            text += f"  ·  {self._n_flagged} flagged"
+        self._count_label.setText(text)
 
-    def _start_thumbnail_loader(self, paths: List[str]):
-        loader = ThumbnailLoader(paths, self)
-        loader.thumbnail_ready.connect(self._on_thumbnail_ready)
-        loader.finished.connect(
-            lambda l=loader: self._loaders.remove(l) if l in self._loaders else None
-        )
-        self._loaders.append(loader)
-        loader.start()
+    # ---- Lazy thumbnails -------------------------------------------------
 
-    def _stop_all_loaders(self):
-        for loader in self._loaders:
-            loader.cancel()
-            loader.wait(500)
-        self._loaders.clear()
+    def _visible_row_range(self):
+        if self._list.count() == 0:
+            return 0, -1
+        viewport = self._list.viewport().rect()
+        first = self._list.indexAt(QPoint(4, 0)).row()
+        last  = self._list.indexAt(QPoint(4, max(0, viewport.height() - 2))).row()
+        if first < 0:
+            first = 0
+        if last < 0:
+            last = min(self._list.count() - 1, first + 30)
+        return max(0, first - VIEW_MARGIN), min(self._list.count() - 1,
+                                                last + VIEW_MARGIN)
+
+    def _request_visible_thumbnails(self):
+        first, last = self._visible_row_range()
+        for i in range(first, last + 1):
+            item = self._list.item(i)
+            if not isinstance(item, ImageQueueItem) or item.isHidden():
+                continue
+            if item.icon().isNull():
+                self._thumbs.request(item.image_path)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._thumb_timer.start(0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._thumb_timer.start(80)
+
+    def shutdown(self):
+        self._thumb_timer.stop()
+        self._thumbs.shutdown()
 
     def closeEvent(self, event):
-        self._stop_all_loaders()
+        self.shutdown()
         super().closeEvent(event)

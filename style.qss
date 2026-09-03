@@ -467,3 +467,61 @@ QToolButton#danger_tool_btn:hover {
     border: 1px solid #f38ba8;
     border-radius: 5px;
 }
+
+/* ── Performance / annotation additions ─────────────────────────── */
+
+/* "Loading…" hint shown while a large image decodes */
+QLabel#viewer_hint {
+    background: rgba(30, 30, 46, 210);
+    color: #a6adc8;
+    border: 1px solid #45475a;
+    border-radius: 6px;
+    font-size: 13px;
+    padding: 6px 14px;
+}
+
+/* Live box size / position readout while drawing or dragging */
+QLabel#box_readout {
+    background: rgba(30, 30, 46, 220);
+    color: #89b4fa;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 3px 8px;
+}
+
+/* Queue state filter (All / Pending / Done / Flagged) */
+QComboBox#queue_filter_combo {
+    background: #313244;
+    color: #a6adc8;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    font-size: 12px;
+    padding: 1px 6px;
+    min-width: 74px;
+}
+QComboBox#queue_filter_combo:hover { background: #45475a; }
+QComboBox#queue_filter_combo QAbstractItemView {
+    background: #1e1e2e;
+    color: #cdd6f4;
+    selection-background-color: #89b4fa;
+    selection-color: #1e1e2e;
+}
+
+/* Review grid contact sheet */
+QListWidget#review_grid {
+    background: #181825;
+    border: 1px solid #313244;
+    border-radius: 6px;
+    font-size: 12px;
+}
+QListWidget#review_grid::item {
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 4px;
+}
+QListWidget#review_grid::item:selected {
+    background: #313244;
+    border-color: #89b4fa;
+}

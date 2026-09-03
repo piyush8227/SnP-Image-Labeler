@@ -65,8 +65,38 @@ def _install_crash_hook():
     sys.excepthook = handle
 
 
+def _set_taskbar_identity():
+    """
+    Windows groups taskbar buttons by AppUserModelID. Without an explicit one
+    a script run is grouped under python.exe and shows the Python icon, no
+    matter what the window icon is.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "SnP.ImageLabeler.Desktop.1"
+        )
+    except Exception:
+        pass
+
+
+def _application_icon():
+    """Prefer the multi-resolution .ico, fall back to the 256 px PNG."""
+    from PyQt5.QtGui import QIcon
+    for name in ("icon.ico", "icon.png"):
+        path = _resource(name)
+        if os.path.isfile(path):
+            icon = QIcon(path)
+            if not icon.isNull():
+                return icon
+    return None
+
+
 def main():
     _install_crash_hook()
+    _set_taskbar_identity()
 
     from PyQt5.QtCore import Qt
     from PyQt5.QtWidgets import QApplication
@@ -78,6 +108,10 @@ def main():
     app.setApplicationName("SnP Image Labeler")
     app.setApplicationVersion("1.0.0")
     app.setOrganizationName("SnP")
+
+    icon = _application_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)      # window, taskbar and every dialog
 
     qss_path = _resource("style.qss")
     try:

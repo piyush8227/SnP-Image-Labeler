@@ -7,35 +7,54 @@ right-hand panel swap with the active task.
   Annotation task (default)
     - Single output file per image: {image_name}.json or {image_name}.csv
     - Contains: image_name + telemetry fields + currency_country_bounding_box
-    - Autosave triggers: box drawn/modified/deleted, telemetry changed, navigate away
-    - Output directory prompt if not yet set
+      (left/top/right/bottom + the label typed for the box)
+    - Autosave is dirty-driven: only a real edit writes a file, so browsing
+      the queue never creates empty labels or marks images done
+    - Undo/redo (Ctrl+Z / Ctrl+Y) over box add / move / resize / delete
 
   Segregation task
     - Copies each image into {dataset_root}/{Class}_data/{split}/
     - Multi-class with an independent train/test/val split per class
     - Progress tracked in the dataset root so a part-done folder resumes cleanly
+
+Keyboard
+    D / Right      next image           A / Left      previous image
+    Ctrl+S         save                 Ctrl+Z / Y    undo / redo
+    N              navigate mode        B             annotate (box) mode
+    F              fit to window        R             reload image
+    Ctrl+F         flag for review      Ctrl+G        review grid
+    1-9            quick label (annotation) / split (segregation)
+    Space / MMB    pan          Alt+Arrows  nudge box      Del  delete box
 """
 
 import inspect
 import os
 import sys
+import time
 import traceback
+from collections import deque
 from pathlib import Path
 from typing import List, Optional
 
-from PyQt5.QtCore import QByteArray, QSize, Qt, QTimer, QUrl
+from PyQt5.QtCore import (
+    QByteArray, QEvent, QSize, Qt, QThread, QTimer, QUrl, pyqtSignal,
+)
 from PyQt5.QtGui import QDesktopServices, QKeySequence
 from PyQt5.QtWidgets import (
-    QAction, QComboBox, QFileDialog, QLabel, QMainWindow,
-    QMessageBox, QShortcut, QSplitter, QStackedWidget, QStatusBar, QToolBar,
+    QAbstractSpinBox, QAction, QApplication, QComboBox, QFileDialog, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressDialog,
+    QShortcut, QSplitter, QStackedWidget, QStatusBar, QTextEdit, QToolBar,
     QVBoxLayout, QHBoxLayout, QFrame, QTabWidget, QWidget,
 )
 
 from core.config_manager     import ConfigManager
 from core.duplicate_finder   import DEFAULT_SENSITIVITY
+from core.label_index        import LabelIndex, ReviewFlags
 from core.label_manager      import LabelManager
 from core.rejection_manager  import REJECTED_DIRNAME, move_to_rejected, rejected_dir
 from core.segregation_manager import SPLITS, SPLIT_LABELS, SegregationManager
+from core.session_store      import SessionStore
+from core.undo_stack         import UndoStack
 from widgets.annotation_viewer import AnnotationViewer, ViewerMode
 from widgets.class_editor    import ClassEditorDialog
 from widgets.duplicate_dialog import (
@@ -43,7 +62,8 @@ from widgets.duplicate_dialog import (
     ask_duplicate_action,
 )
 from widgets.duplicate_scan_dialog import DuplicateScanDialog
-from widgets.image_queue     import ImageQueuePanel
+from widgets.image_queue     import DONE, FLAGGED, PENDING, ImageQueuePanel
+from widgets.review_grid     import ReviewGridDialog
 from widgets.telemetry_panel  import TelemetryPanel
 from widgets.bbox_panel      import BBoxPanel
 from widgets.field_editor    import FieldEditorDialog
@@ -54,6 +74,11 @@ IMG_FILTER     = "Images (*.jpg *.jpeg *.png *.bmp *.gif *.tiff *.tif *.webp)"
 
 TASK_ANNOTATION  = "annotation"
 TASK_SEGREGATION = "segregation"
+
+BBOX_FIELD   = "currency_country_bounding_box"
+NAV_SETTLE_MS = 70          # coalesce held-down Next/Prev before decoding
+PREFETCH_AHEAD = 2
+PREFETCH_BEHIND = 1
 
 
 # ------------------------------------------------------------------ #
@@ -85,6 +110,53 @@ def _safe_slot(fn):
 
 
 # ------------------------------------------------------------------ #
+#  Folder scanner — walks a tree without freezing the UI              #
+# ------------------------------------------------------------------ #
+
+class FolderScanner(QThread):
+    progress = pyqtSignal(int)          # files seen so far
+    done     = pyqtSignal(list)         # image paths, sorted
+
+    def __init__(self, folder: str, recursive: bool, parent=None):
+        super().__init__(parent)
+        self._folder    = folder
+        self._recursive = recursive
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        found: List[str] = []
+        seen = 0
+        try:
+            if self._recursive:
+                for root, dirs, files in os.walk(self._folder):
+                    if self._cancelled:
+                        break
+                    dirs[:] = [d for d in dirs if d != REJECTED_DIRNAME]
+                    for name in files:
+                        seen += 1
+                        if os.path.splitext(name)[1].lower() in SUPPORTED_EXTS:
+                            found.append(os.path.join(root, name))
+                        if seen % 500 == 0:
+                            self.progress.emit(seen)
+            else:
+                with os.scandir(self._folder) as entries:
+                    for entry in entries:
+                        if self._cancelled:
+                            break
+                        seen += 1
+                        if entry.is_file() and os.path.splitext(entry.name)[1].lower() in SUPPORTED_EXTS:
+                            found.append(entry.path)
+                        if seen % 500 == 0:
+                            self.progress.emit(seen)
+        except OSError:
+            pass
+        self.done.emit([] if self._cancelled else sorted(found))
+
+
+# ------------------------------------------------------------------ #
 #  Main Window                                                         #
 # ------------------------------------------------------------------ #
 
@@ -99,21 +171,45 @@ class MainWindow(QMainWindow):
             or self._config.segregation_output_directory
         )
 
+        # Fast "is this image done?" — one directory scan, not 2 stats/image
+        out_dir = self._config.get("output_directory", "")
+        self._label_index  = LabelIndex(out_dir)
+        self._review_flags = ReviewFlags(out_dir)
+
         self._task = self._config.active_task
         self._image_paths:   List[str] = []
         self._current_index: int       = -1
 
+        # Edit tracking — nothing is written unless the user actually changed
+        # something on this image.
+        self._dirty         = False
+        self._applying_undo = False
+        self._undo          = UndoStack()
+
         # "Apply to all remaining" answer from the already-processed dialog.
-        # Session-scoped: cleared on import, queue clear and dataset change.
         self._dup_action: Optional[str] = None
-
-        # Non-modal duplicate scanner, kept alive while the user works the queue
         self._dup_dialog: Optional[DuplicateScanDialog] = None
+        self._grid_dialog: Optional[ReviewGridDialog] = None
+        self._scanner: Optional[FolderScanner] = None
 
-        # Debounce autosave — wait 400 ms after last change before writing
+        # Debounced autosave
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.timeout.connect(self._do_autosave)
+
+        # Navigation coalescing — holding Next must not decode every image
+        self._nav_timer = QTimer(self)
+        self._nav_timer.setSingleShot(True)
+        self._nav_timer.timeout.connect(self._settle_navigation)
+
+        # Session persistence (debounced — the queue can be very large)
+        self._session = SessionStore()
+        self._session_timer = QTimer(self)
+        self._session_timer.setSingleShot(True)
+        self._session_timer.timeout.connect(self._save_session)
+
+        # Throughput samples for the ETA readout
+        self._completions: deque = deque(maxlen=40)
 
         self.setWindowTitle("SnP Image Labeler")
         self.setMinimumSize(1150, 700)
@@ -126,6 +222,10 @@ class MainWindow(QMainWindow):
         self._load_segregation_settings()
         self._restore_geometry()
         self._apply_task(self._task, initial=True)
+        self._apply_viewer_preferences()
+
+        QApplication.instance().installEventFilter(self)
+        QTimer.singleShot(0, self._offer_resume)
 
     # ================================================================== #
     #  UI Construction                                                     #
@@ -149,6 +249,7 @@ class MainWindow(QMainWindow):
         self._queue.image_selected.connect(self._on_queue_selection)
         self._queue.remove_requested.connect(self._remove_from_queue)
         self._queue.delete_requested.connect(self._delete_image)
+        self._queue.flag_requested.connect(self._toggle_flag_for)
         self._queue.clear_all_requested.connect(self._clear_queue)
         splitter.addWidget(self._queue)
 
@@ -158,12 +259,13 @@ class MainWindow(QMainWindow):
         cv.setContentsMargins(0, 0, 0, 0)
         cv.setSpacing(0)
 
-        self._viewer = AnnotationViewer()
+        self._viewer = AnnotationViewer(cache_budget_mb=self._config.image_cache_mb)
         self._viewer.zoom_changed.connect(self._on_zoom)
-        self._viewer.box_added.connect(self._on_box_changed)
-        self._viewer.box_modified.connect(self._on_box_changed)
-        self._viewer.box_deleted.connect(self._on_box_changed)
+        self._viewer.boxes_changed.connect(self._on_boxes_changed)
         self._viewer.selection_changed.connect(self._on_selection_changed)
+        self._viewer.image_loaded.connect(self._on_image_loaded)
+        self._viewer.image_failed.connect(self._on_image_failed)
+        self._viewer.status_message.connect(self._set_status)
         cv.addWidget(self._viewer, 1)
 
         # Info bar
@@ -208,8 +310,7 @@ class MainWindow(QMainWindow):
 
         self._telemetry = TelemetryPanel()
         self._telemetry.save_requested.connect(self._manual_save)
-        # Autosave trigger: any telemetry field change
-        self._telemetry.values_changed.connect(self._schedule_autosave)
+        self._telemetry.values_changed.connect(self._on_telemetry_edited)
         self._right_tabs.addTab(self._telemetry, "Telemetry")
 
         self._bbox_panel = BBoxPanel()
@@ -248,7 +349,6 @@ class MainWindow(QMainWindow):
             tb.addAction(a)
             return a
 
-        # Actions that belong to only one task (shown/hidden on task switch)
         self._annot_only: List[QAction] = []
         self._seg_only:   List[QAction] = []
 
@@ -271,6 +371,9 @@ class MainWindow(QMainWindow):
         act("Find Duplicates",
             "Scan for the same picture stored more than once  (Ctrl+D)",
             self._find_duplicates)
+        act("Review Grid",
+            "Contact sheet of the queue with saved boxes drawn on  (Ctrl+G)",
+            self._open_review_grid)
         self._act_delete = act(
             "Delete Image",
             "Move this image out of the working set into _rejected  (Shift+Del)",
@@ -279,24 +382,41 @@ class MainWindow(QMainWindow):
         if delete_button is not None:
             delete_button.setObjectName("danger_tool_btn")
         tb.addSeparator()
-        act("Prev",    "Previous image  (Left)",             self._prev)
-        act("Next",    "Next image  (Right)",                self._next)
+        act("Prev",    "Previous image  (A / Left)",         self._prev)
+        act("Next",    "Next image  (D / Right)",            self._next)
+        self._act_flag = QAction("Flag", self)
+        self._act_flag.setToolTip("Flag this image for review  (Ctrl+F)")
+        self._act_flag.setCheckable(True)
+        self._act_flag.triggered.connect(self._toggle_flag)
+        tb.addAction(self._act_flag)
         tb.addSeparator()
         act("Zoom+",   "Zoom In  (Ctrl++)",                  self._zoom_in)
         act("Zoom-",   "Zoom Out  (Ctrl+-)",                 self._zoom_out)
         act("Fit",     "Fit to window  (F)",                 self._fit)
-        act("Refresh", "Refresh  (R)",                       self._refresh)
+
+        self._act_zoom_lock = QAction("Lock Zoom", self)
+        self._act_zoom_lock.setToolTip(
+            "Keep the current zoom and pan when moving to the next image  (Ctrl+L)")
+        self._act_zoom_lock.setCheckable(True)
+        self._act_zoom_lock.triggered.connect(self._toggle_zoom_lock)
+        tb.addAction(self._act_zoom_lock)
+
+        act("Refresh", "Reload this image from disk  (R)",   self._refresh)
         tb.addSeparator()
 
         # ── Annotation-only controls ──────────────────────────────
+        self._annot_only.append(
+            act("Undo", "Undo the last box change  (Ctrl+Z)", self._undo_action))
+        self._annot_only.append(
+            act("Redo", "Redo  (Ctrl+Y)", self._redo_action))
+        self._annot_only.append(tb.addSeparator())
+
         self._annot_only.append(tb.addWidget(QLabel("  Format: ")))
         self._fmt_combo = QComboBox()
         self._fmt_combo.addItems(["CSV", "JSON"])
         self._fmt_combo.setCurrentText(self._config.export_format.upper())
         self._fmt_combo.setFixedWidth(78)
-        self._fmt_combo.currentTextChanged.connect(
-            lambda t: setattr(self._config, "export_format", t.lower())
-        )
+        self._fmt_combo.currentTextChanged.connect(self._on_format_changed)
         self._annot_only.append(tb.addWidget(self._fmt_combo))
 
         self._annot_only.append(
@@ -318,12 +438,20 @@ class MainWindow(QMainWindow):
         self._annot_only.append(self._act_nav)
 
         self._act_annot = QAction("Annotate", self)
-        self._act_annot.setToolTip("Annotate mode — draw bounding box  (A)")
+        self._act_annot.setToolTip("Annotate mode — draw bounding box  (B)")
         self._act_annot.setCheckable(True)
         self._act_annot.setChecked(False)
         self._act_annot.triggered.connect(self._mode_annotate)
         tb.addAction(self._act_annot)
         self._annot_only.append(self._act_annot)
+
+        self._act_sticky = QAction("Sticky Label", self)
+        self._act_sticky.setToolTip(
+            "Reuse the last label for new boxes instead of asking every time")
+        self._act_sticky.setCheckable(True)
+        self._act_sticky.triggered.connect(self._toggle_sticky_label)
+        tb.addAction(self._act_sticky)
+        self._annot_only.append(self._act_sticky)
 
         self._annot_only.append(tb.addSeparator())
         self._annot_only.append(
@@ -352,6 +480,11 @@ class MainWindow(QMainWindow):
         self.setStatusBar(sb)
         self._sb_msg = QLabel("Ready — Import images to get started.")
         sb.addWidget(self._sb_msg, 1)
+
+        self._sb_progress = QLabel("")
+        self._sb_progress.setObjectName("outdir_label")
+        sb.addPermanentWidget(self._sb_progress)
+
         self._sb_stats = QLabel("")
         self._sb_stats.setObjectName("outdir_label")
         self._sb_stats.setVisible(False)
@@ -362,27 +495,27 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self._sb_outdir)
 
     def _bind_shortcuts(self):
-        QShortcut(QKeySequence("Left"),   self, self._prev)
-        QShortcut(QKeySequence("Right"),  self, self._next)
-        QShortcut(QKeySequence("Ctrl+S"), self, self._manual_save)
-        QShortcut(QKeySequence("Ctrl+O"), self, self._import)
-        QShortcut(QKeySequence("Ctrl+D"), self, self._find_duplicates)
+        # Single letters (A / D / N / B / F / R / digits) are handled in
+        # eventFilter so they never steal a keystroke from a text field.
+        QShortcut(QKeySequence("Left"),      self, self._prev)
+        QShortcut(QKeySequence("Right"),     self, self._next)
+        QShortcut(QKeySequence("Ctrl+S"),    self, self._manual_save)
+        QShortcut(QKeySequence("Ctrl+Z"),    self, self._undo_action)
+        QShortcut(QKeySequence("Ctrl+Y"),    self, self._redo_action)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, self._redo_action)
+        QShortcut(QKeySequence("Ctrl+O"),    self, self._import)
+        QShortcut(QKeySequence("Ctrl+D"),    self, self._find_duplicates)
+        QShortcut(QKeySequence("Ctrl+F"),    self, self._toggle_flag)
+        QShortcut(QKeySequence("Ctrl+G"),    self, self._open_review_grid)
+        QShortcut(QKeySequence("Ctrl+L"),    self, self._toggle_zoom_lock)
         QShortcut(QKeySequence("Shift+Del"), self, self._delete_current_image)
-        QShortcut(QKeySequence("Ctrl++"), self, self._zoom_in)
-        QShortcut(QKeySequence("Ctrl+="), self, self._zoom_in)
-        QShortcut(QKeySequence("Ctrl+-"), self, self._zoom_out)
-        QShortcut(QKeySequence("F"),      self, self._fit)
-        QShortcut(QKeySequence("R"),      self, self._refresh)
-        QShortcut(QKeySequence("N"),      self, self._mode_navigate)
-        QShortcut(QKeySequence("A"),      self, self._mode_annotate)
+        QShortcut(QKeySequence("Ctrl++"),    self, self._zoom_in)
+        QShortcut(QKeySequence("Ctrl+="),    self, self._zoom_in)
+        QShortcut(QKeySequence("Ctrl+-"),    self, self._zoom_out)
+        QShortcut(QKeySequence("Ctrl+0"),    self, self._zoom_reset)
 
-        # Task switch
         QShortcut(QKeySequence("Ctrl+1"), self, lambda: self._set_task(TASK_ANNOTATION))
         QShortcut(QKeySequence("Ctrl+2"), self, lambda: self._set_task(TASK_SEGREGATION))
-
-        # Segregation keys (1/2/3 = split, Enter = assign) are handled in
-        # keyPressEvent, not as QShortcuts, so they never steal keystrokes
-        # from a focused spin box or text field.
 
     def _restore_geometry(self):
         geom = self._config.get("window_geometry")
@@ -394,16 +527,91 @@ class MainWindow(QMainWindow):
                 pass
         self.resize(1300, 820)
 
+    def _apply_viewer_preferences(self):
+        locked = self._config.zoom_locked
+        self._viewer.set_zoom_locked(locked)
+        self._act_zoom_lock.setChecked(locked)
+
+        sticky = self._config.annotation_sticky_label
+        recent = self._config.annotation_recent_labels
+        self._viewer.set_recent_labels(recent)
+        self._viewer.set_sticky_label(sticky, recent[0] if recent else "")
+        self._viewer.set_max_boxes(self._config.annotation_max_boxes)
+        self._act_sticky.setChecked(sticky)
+
+    # ================================================================== #
+    #  Keyboard — application-wide filter                                 #
+    # ================================================================== #
+
+    @staticmethod
+    def _is_text_entry(widget) -> bool:
+        """True when a keystroke belongs to the widget, not to a shortcut."""
+        return isinstance(widget, (QLineEdit, QAbstractSpinBox, QTextEdit,
+                                   QPlainTextEdit, QComboBox))
+
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.KeyPress:
+            return False
+        if not self.isActiveWindow():
+            return False                       # a dialog owns the keyboard
+        if self._is_text_entry(QApplication.focusWidget()):
+            return False
+        mods = event.modifiers()
+        if mods & (Qt.ControlModifier | Qt.MetaModifier):
+            return False                       # Ctrl+… handled by QShortcut
+        key = event.key()
+
+        if key == Qt.Key_D and not (mods & Qt.AltModifier):
+            self._next()
+            return True
+        if key == Qt.Key_A and not (mods & Qt.AltModifier):
+            self._prev()
+            return True
+        if key == Qt.Key_N:
+            self._mode_navigate()
+            return True
+        if key == Qt.Key_B:
+            self._mode_annotate()
+            return True
+        if key == Qt.Key_F:
+            self._fit()
+            return True
+        if key == Qt.Key_R:
+            self._refresh()
+            return True
+        if (key == Qt.Key_Delete and self._task == TASK_ANNOTATION
+                and not (mods & Qt.ShiftModifier)):   # Shift+Del = reject image
+            # Works wherever the focus is, not only inside the viewer
+            if self._viewer.delete_selected_boxes():
+                self._set_status("Box deleted  (Ctrl+Z to undo)")
+                return True
+            return False
+        if Qt.Key_1 <= key <= Qt.Key_9:
+            return self._handle_digit(key - Qt.Key_0)
+        return False
+
+    def _handle_digit(self, digit: int) -> bool:
+        if self._task == TASK_SEGREGATION:
+            if 1 <= digit <= len(SPLITS):
+                self._seg_set_split(SPLITS[digit - 1])
+                return True
+            return False
+        labels = self._viewer.existing_labels()
+        if digit <= len(labels):
+            label = labels[digit - 1]
+            if self._viewer.apply_label_to_selection(label):
+                self._set_status(f"Label: {label}")
+            else:
+                self._viewer.set_sticky_label(self._act_sticky.isChecked(), label)
+                self._set_status(f"Next box will be labelled: {label}")
+            return True
+        return False
+
     # ================================================================== #
     #  Output directory — ensure set before saving                        #
     # ================================================================== #
 
     def _ensure_output_dir(self) -> bool:
-        """
-        Returns True if output directory is confirmed set.
-        If not explicitly set, prompts user to choose one.
-        """
-        # Config stores "" when not set; output_directory property falls back to home
         raw = self._config.get("output_directory", "")
         if raw:
             return True
@@ -420,11 +628,22 @@ class MainWindow(QMainWindow):
             self._set_status("Output directory not set — label file not saved.")
             return False
 
-        self._config.output_directory = folder
-        self._label_mgr.set_output_directory(folder)
-        self._sb_outdir.setText(f"Output: {folder}")
+        self._set_output_directory(folder)
         self._set_status(f"Output directory set: {folder}")
         return True
+
+    def _set_output_directory(self, folder: str):
+        """Point every label-aware component at a new output directory."""
+        self._config.output_directory = folder
+        self._label_mgr.set_output_directory(folder)
+        self._label_index.set_directory(folder)
+        self._label_index.rebuild()
+        self._review_flags.set_directory(folder)
+        self._review_flags.load()
+        self._sb_outdir.setText(f"Output: {folder}")
+        if self._task == TASK_ANNOTATION:
+            self._queue.refresh_status(self._status_checker())
+            self._update_progress_readout()
 
     # ================================================================== #
     #  Task switching                                                      #
@@ -433,9 +652,9 @@ class MainWindow(QMainWindow):
     @_safe_slot
     def _set_task(self, task: str):
         if task == self._task:
-            self._sync_task_actions()      # keep toggles consistent on re-click
+            self._sync_task_actions()
             return
-        if self._task == TASK_ANNOTATION:  # flush pending label write first
+        if self._task == TASK_ANNOTATION:
             self._flush_autosave()
         self._apply_task(task)
 
@@ -449,10 +668,10 @@ class MainWindow(QMainWindow):
             action.setVisible(not seg)
         for action in self._seg_only:
             action.setVisible(seg)
+        self._act_flag.setVisible(not seg)
         self._right_stack.setCurrentIndex(1 if seg else 0)
 
         if seg:
-            # Segregation never draws boxes — lock the viewer to pan/zoom
             self._viewer.set_mode(ViewerMode.NAVIGATE)
             self._act_nav.setChecked(True)
             self._act_annot.setChecked(False)
@@ -462,15 +681,20 @@ class MainWindow(QMainWindow):
         else:
             self._queue.set_status_labels("Labeled")
             self._sb_outdir.setText(f"Output: {self._config.output_directory}")
+            self._label_index.set_directory(self._config.get("output_directory", ""))
+            self._review_flags.set_directory(self._config.get("output_directory", ""))
+            self._label_index.rebuild()
+            self._review_flags.load()
 
         self._sb_stats.setVisible(seg)
         self._queue.refresh_status(self._status_checker())
+        self._update_progress_readout()
 
-        # Reload the current image under the new task. Blanking the index first
-        # skips _navigate's autosave flush, so merely switching tasks never
-        # writes a label file.
+        # Reload the current image under the new task. Blanking the index
+        # first skips the autosave flush — switching tasks never writes.
         if 0 <= self._current_index < len(self._image_paths):
             index, self._current_index = self._current_index, -1
+            self._dirty = False
             self._navigate(index)
         else:
             self._refresh_seg_view()
@@ -486,9 +710,20 @@ class MainWindow(QMainWindow):
         self._act_task_seg.setChecked(self._task == TASK_SEGREGATION)
 
     def _status_checker(self):
-        """The 'is this image done?' test for the active task."""
-        return (self._seg_mgr.is_done if self._task == TASK_SEGREGATION
-                else self._label_mgr.has_label)
+        """
+        The queue's per-row state test for the active task.
+
+        Flagged wins over done on purpose: an image someone marked for review
+        is not finished work, and it must stay findable.
+        """
+        if self._task == TASK_SEGREGATION:
+            return lambda p: DONE if self._seg_mgr.is_done(p) else PENDING
+
+        def state(path: str) -> int:
+            if self._review_flags.is_flagged(path):
+                return FLAGGED
+            return DONE if self._label_index.has(path) else PENDING
+        return state
 
     # ================================================================== #
     #  Segregation — settings & classes                                    #
@@ -551,8 +786,8 @@ class MainWindow(QMainWindow):
 
         self._config.segregation_output_directory = folder
         self._dup_action = None
-        self._seg_mgr.set_root(folder)                 # loads that root's record
-        healed = self._seg_mgr.verify()                # forget copies deleted by hand
+        self._seg_mgr.set_root(folder)
+        healed = self._seg_mgr.verify()
         self._sb_outdir.setText(f"Dataset: {folder}")
         self._queue.refresh_status(self._status_checker())
         self._refresh_seg_view()
@@ -602,7 +837,6 @@ class MainWindow(QMainWindow):
         if not self._ensure_dataset_dir():
             return
 
-        # Already in processed_images.csv? Ask before touching it again.
         record = self._seg_mgr.find_record(path)
         if record:
             action = self._dup_action
@@ -631,10 +865,11 @@ class MainWindow(QMainWindow):
             return
 
         last_split = assignments[-1]["split"]
-        if self._config.segregation_last_split != last_split:   # avoid a disk write per image
+        if self._config.segregation_last_split != last_split:
             self._config.segregation_last_split = last_split
         self._seg_panel.set_default_split(last_split)
         self._queue.mark_labeled(path, True)
+        self._record_completion()
 
         summary = f"{Path(path).name} → {msg}"
         if record and self._dup_action == DUP_UPDATE:
@@ -695,27 +930,29 @@ class MainWindow(QMainWindow):
         )
         self._seg_panel.set_counts(self._seg_mgr.all_counts())
         total = len(self._image_paths)
-        done  = sum(1 for p in self._image_paths if self._seg_mgr.is_done(p))
-        self._sb_stats.setText(f"Segregated: {done} / {total}")
+        self._sb_stats.setText(f"Segregated: {self._queue.done_count} / {total}")
 
     # ================================================================== #
-    #  Autosave                                                            #
+    #  Autosave — dirty-driven                                             #
     # ================================================================== #
+
+    def _mark_dirty(self):
+        self._dirty = True
+        self._schedule_autosave()
 
     def _schedule_autosave(self, *args):
         """Debounced: coalesces rapid changes into a single save after 400 ms."""
-        if self._task != TASK_ANNOTATION:
+        if self._task != TASK_ANNOTATION or not self._dirty:
             return
         if self._current_index >= 0 and self._image_paths:
             self._autosave_timer.start(400)
 
     def _do_autosave(self, prompt: bool = True):
         """
-        Write the label file. Called by the debounce timer (prompt=True) and by
-        _flush_autosave (prompt=False) when leaving an image, switching task or
-        closing — a flush must never pop a dialog.
+        Write the label file — but only when the user actually changed
+        something. Merely opening an image must never create a file.
         """
-        if self._task != TASK_ANNOTATION:
+        if self._task != TASK_ANNOTATION or not self._dirty:
             return
         path = self._current_image_path()
         if not path:
@@ -731,7 +968,8 @@ class MainWindow(QMainWindow):
     def _flush_autosave(self):
         """Commit pending changes silently (no output-directory prompt)."""
         self._autosave_timer.stop()
-        self._do_autosave(prompt=False)
+        if self._dirty:
+            self._do_autosave(prompt=False)
 
     def _write_label_file(self, path: str, silent: bool = False) -> bool:
         """Build and save the unified label file for the given image."""
@@ -743,12 +981,20 @@ class MainWindow(QMainWindow):
         values = {
             "image_name": image_name,
             **telemetry,
-            "currency_country_bounding_box": bbox,
+            BBOX_FIELD: bbox,
         }
 
+        was_done = self._label_index.has(path)
         ok = self._label_mgr.save_label(path, values, fmt)
         if ok:
-            self._queue.mark_labeled(path, True)
+            self._dirty = False
+            self._label_index.mark(path)
+            if not self._review_flags.is_flagged(path):
+                self._queue.mark_labeled(path, True)
+            if not was_done:
+                self._record_completion()
+            self._remember_box_label(bbox.get("label", ""))
+            self._update_progress_readout()
             if not silent:
                 stem = Path(path).stem
                 self._set_status(
@@ -758,6 +1004,55 @@ class MainWindow(QMainWindow):
             if not silent:
                 QMessageBox.critical(self, "Save Error", "Failed to write label file.")
         return ok
+
+    def _remember_box_label(self, label: str):
+        if not label:
+            return
+        recent = self._config.annotation_recent_labels
+        if recent and recent[0] == label:
+            return
+        recent = [label] + [l for l in recent if l != label]
+        self._config.annotation_recent_labels = recent
+        self._viewer.set_recent_labels(recent)
+
+    # ================================================================== #
+    #  Progress / ETA                                                      #
+    # ================================================================== #
+
+    def _record_completion(self):
+        self._completions.append(time.monotonic())
+
+    def _update_progress_readout(self):
+        total = len(self._image_paths)
+        if not total:
+            self._sb_progress.setText("")
+            return
+        done    = self._queue.done_count
+        flagged = self._queue.flagged_count
+        pending = max(0, total - done - flagged)
+        text = f"{done}/{total} done"
+        if flagged:
+            text += f"  ·  {flagged} flagged"
+
+        if len(self._completions) >= 3:
+            span = self._completions[-1] - self._completions[0]
+            if span > 0:
+                rate = (len(self._completions) - 1) / span      # images/sec
+                if rate > 0:
+                    text += f"  ·  {rate * 60:.0f}/min"
+                    if pending:
+                        eta = pending / rate
+                        text += f"  ·  ETA {self._format_eta(eta)}"
+        self._sb_progress.setText(text)
+
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        seconds = int(max(0, seconds))
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m"
+        return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
 
     # ================================================================== #
     #  Fields                                                              #
@@ -773,10 +1068,11 @@ class MainWindow(QMainWindow):
             fields = dlg.get_fields()
             self._config.telemetry_fields = fields
             self._telemetry.load_fields(fields)
+            self._reload_current_annotation()
             self._set_status(f"Fields updated — {len(fields)} field(s).")
 
     # ================================================================== #
-    #  Mode                                                                #
+    #  Mode / viewer toggles                                               #
     # ================================================================== #
 
     @_safe_slot
@@ -784,7 +1080,7 @@ class MainWindow(QMainWindow):
         self._viewer.set_mode(ViewerMode.NAVIGATE)
         self._act_nav.setChecked(True)
         self._act_annot.setChecked(False)
-        self._set_status("Mode: Navigate — Pan and zoom. Press A to annotate.")
+        self._set_status("Mode: Navigate — pan and zoom. Press B to draw a box.")
 
     @_safe_slot
     def _mode_annotate(self):
@@ -794,7 +1090,40 @@ class MainWindow(QMainWindow):
         self._viewer.set_mode(ViewerMode.ANNOTATE)
         self._act_nav.setChecked(False)
         self._act_annot.setChecked(True)
-        self._set_status("Mode: Annotate — Drag to draw box. Double-click to relabel. Del to delete.")
+        self._set_status(
+            "Mode: Annotate — drag to draw. Space or middle-mouse pans, "
+            "Alt+Arrows nudge, Del deletes, Ctrl+Z undoes."
+        )
+
+    @_safe_slot
+    def _toggle_zoom_lock(self):
+        locked = not self._viewer.zoom_locked
+        self._viewer.set_zoom_locked(locked)
+        self._config.zoom_locked = locked
+        self._act_zoom_lock.setChecked(locked)
+        self._set_status(
+            "Zoom locked — the next image keeps this zoom and pan."
+            if locked else "Zoom unlocked — each image is fitted to the window."
+        )
+
+    @_safe_slot
+    def _toggle_sticky_label(self):
+        enabled = self._act_sticky.isChecked()
+        self._config.annotation_sticky_label = enabled
+        recent = self._config.annotation_recent_labels
+        self._viewer.set_sticky_label(enabled, recent[0] if recent else "")
+        if enabled:
+            label = self._viewer.sticky_label or "(none yet)"
+            self._set_status(f"Sticky label on — new boxes get: {label}")
+        else:
+            self._set_status("Sticky label off — you will be asked for each box.")
+
+    @_safe_slot
+    def _on_format_changed(self, text: str):
+        self._config.export_format = text.lower()
+        self._label_index.rebuild()
+        if self._task == TASK_ANNOTATION:
+            self._queue.refresh_status(self._status_checker())
 
     # ================================================================== #
     #  Import                                                              #
@@ -828,49 +1157,144 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(
             self, "Select Folder", self._config.last_import_directory,
         )
-        if folder:
-            self._config.last_import_directory = folder
-            paths = sorted(
-                str(p) for p in Path(folder).iterdir()
-                if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS
-            )
-            if not paths:
-                nested = sorted(
-                    str(p) for p in Path(folder).rglob("*")
-                    if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS
-                    and REJECTED_DIRNAME not in p.parts
-                )
-                if nested and QMessageBox.question(
-                    self, "Include Sub-folders?",
-                    f"No images directly in that folder, but {len(nested)} found in "
-                    f"sub-folders. Import them?",
-                    QMessageBox.Yes | QMessageBox.No,
-                ) == QMessageBox.Yes:
-                    paths = nested
-            if paths:
-                self._enqueue(paths)
-            else:
-                QMessageBox.information(self, "No Images",
-                    "No supported images found in that folder.")
+        if not folder:
+            return
+        self._config.last_import_directory = folder
+
+        top_level = self._scan_folder(folder, recursive=False)
+        if top_level is None:
+            return                                   # cancelled
+        if top_level:
+            self._enqueue(top_level)
+            return
+
+        nested = self._scan_folder(folder, recursive=True)
+        if not nested:
+            QMessageBox.information(self, "No Images",
+                                    "No supported images found in that folder.")
+            return
+        if QMessageBox.question(
+            self, "Include Sub-folders?",
+            f"No images directly in that folder, but {len(nested)} found in "
+            f"sub-folders. Import them?",
+            QMessageBox.Yes | QMessageBox.No,
+        ) == QMessageBox.Yes:
+            self._enqueue(nested)
+
+    def _scan_folder(self, folder: str, recursive: bool) -> Optional[List[str]]:
+        """
+        Walk a folder on a worker thread behind a cancellable progress dialog.
+        Returns the image paths, or None when the user cancelled.
+        """
+        progress = QProgressDialog(
+            f"Scanning {folder}…", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Importing")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(250)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        result: dict = {}
+        scanner = FolderScanner(folder, recursive, self)
+        scanner.progress.connect(
+            lambda n: progress.setLabelText(f"Scanning {folder}…\n{n:,} files seen")
+        )
+        scanner.done.connect(lambda paths: result.setdefault("paths", paths))
+        progress.canceled.connect(scanner.cancel)
+
+        self._scanner = scanner
+        scanner.start()
+        while scanner.isRunning():
+            QApplication.processEvents()
+            scanner.wait(30)
+        QApplication.processEvents()          # let the queued done signal land
+        progress.close()
+        self._scanner = None
+
+        paths = result.get("paths", [])
+        if progress.wasCanceled():
+            self._set_status("Import cancelled.")
+            return None
+        return paths
 
     def _enqueue(self, paths: List[str]):
-        self._dup_action = None          # a new import always asks again
+        self._dup_action = None
         existing = set(self._image_paths)
         new = [p for p in paths if p not in existing]
         if not new:
             self._set_status("All selected images already in queue.")
             return
+
+        if self._task == TASK_ANNOTATION:
+            self._label_index.rebuild()
+            self._review_flags.load()
         checker = self._status_checker()
-        if not self._image_paths:
+
+        first_import = not self._image_paths
+        if first_import:
             self._image_paths = list(new)
             self._queue.load_images(new, checker)
-            self._navigate(0)
         else:
             self._image_paths.extend(new)
             self._queue.add_images(new, checker)
+
+        if first_import:
+            self._current_index = -1
+            self._navigate(0)
         if self._task == TASK_SEGREGATION:
             self._refresh_seg_view()
+        self._update_progress_readout()
+        self._touch_session()
         self._set_status(f"Added {len(new)} image(s). Total: {len(self._image_paths)}")
+
+    # ================================================================== #
+    #  Session resume                                                      #
+    # ================================================================== #
+
+    def _touch_session(self):
+        self._session_timer.start(2500)
+
+    def _save_session(self):
+        if self._image_paths:
+            self._session.save(self._image_paths, self._current_index, self._task)
+        else:
+            self._session.clear()
+
+    @_safe_slot
+    def _offer_resume(self):
+        if not self._config.resume_session or self._image_paths:
+            return
+        data = self._session.load()
+        if not data:
+            return
+        paths = self._session.existing(data.get("queue", []))
+        if not paths:
+            self._session.clear()
+            return
+
+        missing = len(data.get("queue", [])) - len(paths)
+        when    = data.get("saved_at", "")
+        answer = QMessageBox.question(
+            self, "Resume Last Session",
+            f"Restore the queue from your last session?\n\n"
+            f"    {len(paths):,} image(s)"
+            + (f"  ({missing} no longer on disk)" if missing else "")
+            + (f"\n    Saved: {when}" if when else "")
+            + "\n\nChoosing No starts empty; the session is kept either way.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        task = data.get("task", self._task)
+        if task in (TASK_ANNOTATION, TASK_SEGREGATION) and task != self._task:
+            self._apply_task(task)
+
+        self._enqueue(paths)
+        index = max(0, min(int(data.get("index", 0)), len(self._image_paths) - 1))
+        if index:
+            self._navigate(index)
+        self._set_status(f"Resumed — {len(paths):,} image(s), back at #{index + 1}.")
 
     # ================================================================== #
     #  Queue management                                                    #
@@ -882,34 +1306,47 @@ class MainWindow(QMainWindow):
 
     def _drop_from_queue(self, paths: List[str]):
         """Take images out of the queue in one pass, then land on a sane row."""
-        present = [p for p in dict.fromkeys(paths) if p in self._image_paths]
+        wanted = dict.fromkeys(paths)
+        # One set, not a fresh list copy per membership test — the duplicate
+        # scanner can drop thousands of rows in one go.
+        in_queue = set(self._image_paths)
+        present = [p for p in wanted if p in in_queue]
         if not present:
             return
-        # Autosave the current image before it can be pulled out from under us
-        if self._current_image_path() in present:
+        if self._current_image_path() in wanted:
             self._flush_autosave()
 
-        first_idx = min(self._image_paths.index(p) for p in present)
+        drop = set(present)
+        first_idx = min((i for i, p in enumerate(self._image_paths) if p in drop),
+                        default=0)
         for path in present:
-            self._image_paths.remove(path)
             self._queue.remove_image(path)
+        # One rebuild instead of a linear remove per path
+        self._image_paths = [p for p in self._image_paths if p not in drop]
 
         if not self._image_paths:
             self._reset_empty_view()
+            self._update_progress_readout()
+            self._touch_session()
             self._set_status("Queue empty.")
             return
 
         new_idx = min(first_idx, len(self._image_paths) - 1)
         self._current_index = -1
+        self._dirty = False
         self._navigate(new_idx)
+        self._update_progress_readout()
+        self._touch_session()
 
     def _reset_empty_view(self):
         """Blank every panel — the queue has nothing left to show."""
         self._current_index = -1
-        self._viewer.clear_boxes()
+        self._dirty = False
+        self._nav_timer.stop()
         self._viewer.clear()
         self._bbox_panel.clear()
-        self._telemetry.clear_values()
+        self._telemetry.load_values(None)
+        self._undo.reset([])
         self._lbl_name.setText("No image loaded")
         self._lbl_dims.setText("")
         self._lbl_size.setText("")
@@ -929,6 +1366,10 @@ class MainWindow(QMainWindow):
         self._image_paths.clear()
         self._queue.clear()
         self._reset_empty_view()
+        self._viewer.release_memory()
+        self._completions.clear()
+        self._update_progress_readout()
+        self._session.clear()
         self._set_status("Queue cleared.")
 
     # ================================================================== #
@@ -992,10 +1433,54 @@ class MainWindow(QMainWindow):
     @_safe_slot
     def _show_image(self, path: str):
         """Jump the queue to this image (double-click in the scan results)."""
-        if path in self._image_paths:
-            self._navigate(self._image_paths.index(path))
+        index = self._queue.index_of(path)
+        if index < 0 and path in self._image_paths:
+            index = self._image_paths.index(path)
+        if index >= 0:
+            self._navigate(index)
             self.raise_()
             self.activateWindow()
+
+    # ================================================================== #
+    #  Review grid                                                         #
+    # ================================================================== #
+
+    @_safe_slot
+    def _open_review_grid(self):
+        if not self._image_paths:
+            self._set_status("Nothing to review — import some images first.")
+            return
+        self._flush_autosave()
+        if self._grid_dialog is None:
+            self._grid_dialog = ReviewGridDialog(
+                self._image_paths, self._status_checker(),
+                self._saved_box_for, self,
+            )
+            self._grid_dialog.open_requested.connect(self._show_image)
+            self._grid_dialog.finished.connect(self._on_grid_closed)
+        else:
+            self._grid_dialog.reload(self._image_paths)
+        self._grid_dialog.show()
+        self._grid_dialog.raise_()
+        self._grid_dialog.activateWindow()
+
+    @_safe_slot
+    def _on_grid_closed(self):
+        if self._grid_dialog:
+            self._grid_dialog.deleteLater()
+            self._grid_dialog = None
+
+    def _saved_box_for(self, path: str) -> Optional[dict]:
+        """The stored bounding box for an image, or None."""
+        if not self._label_index.has(path):
+            return None
+        data = self._label_mgr.load_label(path, self._config.export_format)
+        if not data:
+            return None
+        box = data.get(BBOX_FIELD)
+        if isinstance(box, dict) and box.get("left") is not None:
+            return box
+        return None
 
     # ================================================================== #
     #  Delete (move to _rejected)                                          #
@@ -1026,9 +1511,6 @@ class MainWindow(QMainWindow):
         """
         Move images out of the working set: file to _rejected, dataset copies
         deleted, record entry cleared, row taken out of the queue.
-
-        Returns the paths that were dealt with, so a caller (the duplicate
-        scanner) can drop them from its own view.
         """
         wanted = [p for p in dict.fromkeys(paths) if p]
         if not wanted:
@@ -1064,8 +1546,7 @@ class MainWindow(QMainWindow):
         # for an image that is on its way out.
         self._flush_autosave()
 
-        # Label files are the user's work — never bin them without asking
-        labelled = [p for p in wanted if self._label_mgr.has_label(p)]
+        labelled = [p for p in wanted if self._label_index.has(p)]
         drop_labels = bool(labelled) and QMessageBox.question(
             self, "Label Files",
             f"{len(labelled)} of these image(s) have a label file in\n"
@@ -1087,6 +1568,9 @@ class MainWindow(QMainWindow):
                     continue                    # leave the image alone entirely
             if drop_labels:
                 self._label_mgr.delete_label(path)
+                self._label_index.unmark(path)
+            self._review_flags.set_flagged(path, False)
+            self._viewer.invalidate_cache(path)
 
             if Path(path).is_file():
                 ok, msg = move_to_rejected(path, override, dataset, reason)
@@ -1096,7 +1580,6 @@ class MainWindow(QMainWindow):
             handled.append(path)
 
         self._drop_from_queue(handled)
-        self._queue.refresh_status(self._status_checker())
         self._refresh_seg_view()
 
         if failures:
@@ -1129,92 +1612,136 @@ class MainWindow(QMainWindow):
         self._step(1)
 
     def _step(self, delta: int):
-        """Move one image, skipping rows hidden by the queue's Pending filter."""
+        """Move one image, skipping rows hidden by the queue filter."""
         index = self._current_index + delta
         while 0 <= index < len(self._image_paths):
             if self._queue.is_visible(index):
                 self._navigate(index)
                 return
             index += delta
+        if self._image_paths:
+            self._set_status(
+                "Start of queue." if delta < 0 else
+                "End of queue — nothing further matches the queue filter."
+            )
 
     def _navigate(self, index: int):
+        """
+        Switch to an image. The panels update immediately; the decode is
+        coalesced so holding Next does not queue one decode per image.
+        """
         if not self._image_paths or not (0 <= index < len(self._image_paths)):
             return
 
-        # Flush any pending autosave for current image before leaving
-        if self._current_index >= 0:
+        if self._current_index >= 0 and self._current_index != index:
             self._flush_autosave()
 
         self._current_index = index
         path = self._image_paths[index]
 
-        if not self._viewer.load_image(path):
-            self._set_status(f"Failed to load: {Path(path).name}")
-            return
-
-        # Image metadata
-        try:
-            from PyQt5.QtGui import QImageReader
-            reader = QImageReader(path)
-            sz = reader.size()
-            self._lbl_name.setText(Path(path).name)
-            self._lbl_dims.setText(f"{sz.width()} x {sz.height()} px" if sz.isValid() else "")
-            kb = os.path.getsize(path) / 1024
-            self._lbl_size.setText(f"{kb:.0f} KB" if kb < 1024 else f"{kb/1024:.1f} MB")
-        except Exception:
-            self._lbl_name.setText(Path(path).name)
-            self._lbl_dims.setText("")
-            self._lbl_size.setText("")
-
-        if self._task == TASK_SEGREGATION:
-            # Segregation shows the saved class/split for this image instead
-            self._viewer.clear_boxes()
-            self._refresh_seg_view()
-            self._queue.set_current_index(index)
-            done = " — already sorted" if self._seg_mgr.is_done(path) else ""
-            self._set_status(
-                f"Image {index + 1} / {len(self._image_paths)}  —  "
-                f"{Path(path).name}{done}"
-            )
-            return
-
-        # Load existing label file — restore telemetry AND bounding box
-        existing = self._label_mgr.load_label(path, self._config.export_format)
-        if existing:
-            self._telemetry.set_values(existing)
-            # Restore bounding box from label file
-            bbox = existing.get("currency_country_bounding_box", {})
-            if bbox and bbox.get("left") is not None:
-                box_list = [{
-                    "id":     "restored",
-                    "label":  "",
-                    "left":   bbox["left"],
-                    "top":    bbox["top"],
-                    "right":  bbox["right"],
-                    "bottom": bbox["bottom"],
-                }]
-                self._viewer.load_boxes(box_list)
-            else:
-                self._viewer.clear_boxes()
-        else:
-            self._telemetry.clear_values()
-            self._viewer.clear_boxes()
-
-        self._refresh_bbox_panel()
+        self._lbl_name.setText(Path(path).name)
         self._queue.set_current_index(index)
+        self._act_flag.setChecked(self._review_flags.is_flagged(path))
         self._set_status(
             f"Image {index + 1} / {len(self._image_paths)}  —  {Path(path).name}"
+            + (" — already sorted" if self._task == TASK_SEGREGATION
+               and self._seg_mgr.is_done(path) else "")
         )
+        self._touch_session()
+
+        # A cached image can be shown at once; anything else waits for the
+        # navigation to settle so a held-down key decodes once, not 40 times.
+        if self._viewer.is_cached(path):
+            self._nav_timer.stop()
+            self._settle_navigation()
+        else:
+            self._nav_timer.start(NAV_SETTLE_MS)
+
+    def _settle_navigation(self):
+        path = self._current_image_path()
+        if not path:
+            return
+
+        self._dirty = False
+        if self._task == TASK_SEGREGATION:
+            self._viewer.load_image(path, [])
+            self._refresh_seg_view()
+        else:
+            existing = self._label_mgr.load_label(path, self._config.export_format)
+            self._telemetry.load_values(existing)
+            self._viewer.load_image(path, self._boxes_from_label(existing))
+
+        self._lbl_size.setText(self._file_size_text(path))
+        self._viewer.prefetch(self._neighbours())
+
+    def _boxes_from_label(self, existing: Optional[dict]) -> List[dict]:
+        """Rebuild the box list from a saved label file."""
+        if not existing:
+            return []
+        bbox = existing.get(BBOX_FIELD) or {}
+        if not isinstance(bbox, dict) or bbox.get("left") is None:
+            return []
+        return [{
+            "id":     "saved",
+            "label":  bbox.get("label", "") or "",
+            "left":   bbox["left"],
+            "top":    bbox["top"],
+            "right":  bbox["right"],
+            "bottom": bbox["bottom"],
+        }]
+
+    def _neighbours(self) -> List[str]:
+        lo = max(0, self._current_index - PREFETCH_BEHIND)
+        hi = min(len(self._image_paths), self._current_index + PREFETCH_AHEAD + 1)
+        return [self._image_paths[i] for i in range(lo, hi)
+                if i != self._current_index]
+
+    @staticmethod
+    def _file_size_text(path: str) -> str:
+        try:
+            kb = os.path.getsize(path) / 1024
+        except OSError:
+            return ""
+        return f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
+
+    def _reload_current_annotation(self):
+        """Re-read the label file for the current image (fields changed)."""
+        path = self._current_image_path()
+        if not path or self._task != TASK_ANNOTATION:
+            return
+        existing = self._label_mgr.load_label(path, self._config.export_format)
+        self._telemetry.load_values(existing)
 
     # ================================================================== #
-    #  Box events                                                          #
+    #  Viewer events                                                       #
     # ================================================================== #
 
-    def _on_box_changed(self, *args):
-        """Called on box added / modified / deleted — schedule autosave."""
+    @_safe_slot
+    def _on_image_loaded(self, path: str, size: QSize):
+        if size and size.isValid():
+            self._lbl_dims.setText(f"{size.width()} x {size.height()} px")
+        else:
+            self._lbl_dims.setText("")
+        if self._task == TASK_ANNOTATION:
+            self._refresh_bbox_panel()
+            self._undo.reset(self._viewer.get_boxes_data())
+
+    @_safe_slot
+    def _on_image_failed(self, path: str):
+        self._lbl_dims.setText("")
+        self._bbox_panel.clear()
+        self._set_status(f"Failed to load: {Path(path).name}")
+
+    def _on_boxes_changed(self):
+        """A committed box change — panel, undo, dirty flag, autosave."""
         self._refresh_bbox_panel()
-        self._right_tabs.setCurrentIndex(1)
-        self._schedule_autosave()
+        if self._applying_undo:
+            return
+        self._undo.push(self._viewer.get_boxes_data())
+        self._mark_dirty()
+
+    def _on_telemetry_edited(self):
+        self._mark_dirty()
 
     def _on_selection_changed(self):
         box_id = self._viewer.get_selected_box_id()
@@ -1228,28 +1755,88 @@ class MainWindow(QMainWindow):
     @_safe_slot
     def _on_panel_box_delete(self, box_id: str):
         self._viewer.delete_box_by_id(box_id)
-        self._refresh_bbox_panel()
-        self._schedule_autosave()
-        self._set_status("Box deleted.")
+        self._set_status("Box deleted  (Ctrl+Z to undo)")
 
     @_safe_slot
     def _clear_all_boxes(self):
-        path = self._current_image_path()
-        if not path:
-            return
-        if QMessageBox.question(
-            self, "Clear Boxes", "Delete the bounding box for this image?",
-            QMessageBox.Yes | QMessageBox.No,
-        ) != QMessageBox.Yes:
+        if not self._current_image_path() or self._viewer.box_count == 0:
             return
         self._viewer.clear_boxes()
-        self._refresh_bbox_panel()
-        self._schedule_autosave()
-        self._set_status("Box cleared.")
+        self._set_status("Box cleared  (Ctrl+Z to undo)")
 
     @_safe_slot
     def _delete_selected_box(self):
-        self._viewer.delete_selected_boxes()
+        if self._viewer.delete_selected_boxes():
+            self._set_status("Box deleted  (Ctrl+Z to undo)")
+
+    # ================================================================== #
+    #  Undo / redo                                                         #
+    # ================================================================== #
+
+    @_safe_slot
+    def _undo_action(self):
+        if self._task != TASK_ANNOTATION:
+            return
+        state = self._undo.undo()
+        if state is None:
+            self._set_status("Nothing to undo.")
+            return
+        self._apply_undo_state(state)
+        self._set_status("Undone.  (Ctrl+Y redoes)")
+
+    @_safe_slot
+    def _redo_action(self):
+        if self._task != TASK_ANNOTATION:
+            return
+        state = self._undo.redo()
+        if state is None:
+            self._set_status("Nothing to redo.")
+            return
+        self._apply_undo_state(state)
+        self._set_status("Redone.")
+
+    def _apply_undo_state(self, state: List[dict]):
+        self._applying_undo = True
+        try:
+            self._viewer.set_boxes(state)
+        finally:
+            self._applying_undo = False
+        self._refresh_bbox_panel()
+        self._mark_dirty()
+
+    # ================================================================== #
+    #  Flag for review                                                     #
+    # ================================================================== #
+
+    @_safe_slot
+    def _toggle_flag(self):
+        path = self._current_image_path()
+        if not path:
+            self._set_status("No image selected.")
+            return
+        self._toggle_flag_for(path)
+
+    @_safe_slot
+    def _toggle_flag_for(self, path: str):
+        if self._task != TASK_ANNOTATION:
+            self._set_status("Flagging is part of the Annotation task  (Ctrl+1).")
+            return
+        if not self._config.get("output_directory", ""):
+            if not self._ensure_output_dir():
+                return
+        flagged = self._review_flags.toggle(path)
+        if flagged:
+            self._queue.set_flagged(path, True)
+        else:
+            self._queue.set_state(
+                path, DONE if self._label_index.has(path) else PENDING)
+        if path == self._current_image_path():
+            self._act_flag.setChecked(flagged)
+        self._update_progress_readout()
+        self._set_status(
+            f"Flagged for review: {Path(path).name}" if flagged
+            else f"Flag cleared: {Path(path).name}"
+        )
 
     # ================================================================== #
     #  Manual save (Ctrl+S / Save button)                                  #
@@ -1287,13 +1874,10 @@ class MainWindow(QMainWindow):
         )
         if not dest:
             return
-        image_name = Path(path).name
-        telemetry  = self._telemetry.get_values()
-        bbox       = self._viewer.get_single_box()
-        values     = {
-            "image_name": image_name,
-            **telemetry,
-            "currency_country_bounding_box": bbox,
+        values = {
+            "image_name": Path(path).name,
+            **self._telemetry.get_values(),
+            BBOX_FIELD: self._viewer.get_single_box(),
         }
         if self._label_mgr.save_label_to_path(dest, values, fmt):
             self._set_status(f"Exported: {dest}")
@@ -1311,15 +1895,20 @@ class MainWindow(QMainWindow):
     def _zoom_out(self): self._viewer.zoom_out()
 
     @_safe_slot
+    def _zoom_reset(self): self._viewer.zoom_reset()
+
+    @_safe_slot
     def _fit(self):      self._viewer.fit_in_view()
 
     @_safe_slot
     def _refresh(self):
-        if self._current_index >= 0 and self._image_paths:
-            path = self._image_paths[self._current_index]
-            self._viewer.invalidate_cache(path)
-            self._viewer.load_image(path)
-            self._set_status("Image refreshed.")
+        path = self._current_image_path()
+        if not path:
+            return
+        self._viewer.invalidate_cache(path)
+        self._queue.thumbnails.forget(path)
+        self._settle_navigation()
+        self._set_status("Image reloaded from disk.")
 
     @_safe_slot
     def _set_output_dir(self):
@@ -1327,9 +1916,8 @@ class MainWindow(QMainWindow):
             self, "Select Output Directory", self._config.output_directory,
         )
         if folder:
-            self._config.output_directory = folder
-            self._label_mgr.set_output_directory(folder)
-            self._sb_outdir.setText(f"Output: {folder}")
+            self._flush_autosave()
+            self._set_output_directory(folder)
             self._set_status(f"Output directory: {folder}")
 
     def _on_zoom(self, zoom: float):
@@ -1346,7 +1934,7 @@ class MainWindow(QMainWindow):
     def _refresh_bbox_panel(self):
         self._bbox_panel.refresh(
             self._viewer.get_boxes_data(),
-            self._viewer._label_colors,
+            self._viewer.label_colors,
         )
 
     # ================================================================== #
@@ -1354,20 +1942,13 @@ class MainWindow(QMainWindow):
     # ================================================================== #
 
     def keyPressEvent(self, event):
-        """Segregation shortcuts: 1/2/3 pick the split, Enter assigns."""
-        if self._task == TASK_SEGREGATION:
-            split_keys = {
-                Qt.Key_1: SPLITS[0], Qt.Key_2: SPLITS[1], Qt.Key_3: SPLITS[2],
-            }
-            key = event.key()
-            if key in split_keys:
-                self._seg_set_split(split_keys[key])
-                event.accept()
-                return
-            if key in (Qt.Key_Return, Qt.Key_Enter):
-                self._seg_assign()
-                event.accept()
-                return
+        """Enter assigns in the segregation task (splits are in eventFilter)."""
+        if self._task == TASK_SEGREGATION and event.key() in (
+            Qt.Key_Return, Qt.Key_Enter
+        ):
+            self._seg_assign()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     # ================================================================== #
@@ -1377,7 +1958,26 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self._dup_dialog:
             self._dup_dialog.close()
+        if self._grid_dialog:
+            self._grid_dialog.close()
+        if self._scanner is not None:
+            self._scanner.cancel()
+            self._scanner.wait(1000)
+
+        self._nav_timer.stop()
         self._flush_autosave()
+        self._session_timer.stop()
+        self._save_session()
+
+        try:
+            QApplication.instance().removeEventFilter(self)
+        except Exception:
+            pass
+
+        # Stop worker threads before the C++ widgets go away
+        self._queue.shutdown()
+        self._viewer.shutdown()
+
         try:
             self._config.set("window_geometry", bytes(self.saveGeometry()).hex())
         except Exception:

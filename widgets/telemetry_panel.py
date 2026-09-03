@@ -4,7 +4,7 @@ Dynamically renders configured telemetry fields.
 All Qt signal connections are argument-safe.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -194,6 +194,11 @@ class TelemetryPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._widgets: List[TelemetryFieldWidget] = []
+        # True while values are being pushed in programmatically. Qt fires
+        # textChanged / toggled / currentIndexChanged for those too, and
+        # treating them as edits made simply opening an image look like a
+        # change — which wrote an empty label file for every image browsed.
+        self._loading = False
         self._build()
 
     def _build(self):
@@ -260,19 +265,44 @@ class TelemetryPanel(QWidget):
             # Insert before the trailing stretch (always last item)
             self._inner.insertWidget(self._inner.count() - 1, w)
             self._widgets.append(w)
-            w.value_changed.connect(self.values_changed)
+            w.value_changed.connect(self._on_field_changed)
+
+    def _on_field_changed(self):
+        """Only a real user edit counts as a change."""
+        if not self._loading:
+            self.values_changed.emit()
 
     def get_values(self) -> Dict[str, Any]:
         return {w.field_name: w.get_value() for w in self._widgets}
 
     def set_values(self, values: Dict[str, Any]):
-        for w in self._widgets:
-            if w.field_name in values:
-                w.set_value(values[w.field_name])
+        self._loading = True
+        try:
+            for w in self._widgets:
+                if w.field_name in values:
+                    w.set_value(values[w.field_name])
+        finally:
+            self._loading = False
 
     def clear_values(self):
-        for w in self._widgets:
-            w.clear()
+        self._loading = True
+        try:
+            for w in self._widgets:
+                w.clear()
+        finally:
+            self._loading = False
+
+    def load_values(self, values: Optional[Dict[str, Any]]):
+        """Set (or clear) every field without emitting values_changed."""
+        self._loading = True
+        try:
+            for w in self._widgets:
+                if values and w.field_name in values:
+                    w.set_value(values[w.field_name])
+                else:
+                    w.clear()
+        finally:
+            self._loading = False
 
     def has_fields(self) -> bool:
         return bool(self._widgets)

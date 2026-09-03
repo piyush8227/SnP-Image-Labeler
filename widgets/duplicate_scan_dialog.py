@@ -30,7 +30,7 @@ from core.duplicate_finder import (
     DEFAULT_SENSITIVITY, SENSITIVITY, Signature, build_signature,
     group_duplicates, group_headline, human_size, summarise,
 )
-from widgets.image_queue import ThumbnailLoader
+from core.thumbnail_cache import ThumbnailService
 
 PREVIEW_PX = 148
 THUMB_PX   = 48
@@ -143,7 +143,7 @@ class DuplicateScanDialog(QDialog):
         self._dataset_entries = list(dataset_entries or [])
         self._groups: List[Dict[str, Any]] = []
         self._worker: Optional[ScanWorker]  = None
-        self._loader: Optional[ThumbnailLoader] = None
+        self._loader: Optional[ThumbnailService] = None
 
         self._build()
         self._combo.setCurrentIndex(
@@ -403,16 +403,20 @@ class DuplicateScanDialog(QDialog):
         return "  ·  ".join(bits)
 
     def _start_thumbnails(self, paths: List[str]):
-        self._stop_loader()
         alive = [p for p in paths if Path(p).is_file()]
         if not alive:
             return
-        self._loader = ThumbnailLoader(alive, self, size=THUMB_PX)
-        self._loader.thumbnail_ready.connect(self._on_thumbnail)
-        self._loader.start()
+        if self._loader is None:
+            # Shared service: scaled decode, small thread pool, disk cache.
+            self._loader = ThumbnailService(THUMB_PX, "dup", self)
+            self._loader.thumbnail_ready.connect(self._on_thumbnail)
+        else:
+            self._loader.cancel_pending()
+        for path in alive:
+            self._loader.request(path)
 
-    @pyqtSlot(str, QImage)
-    def _on_thumbnail(self, path: str, image: QImage):
+    @pyqtSlot(str, QImage, QSize)
+    def _on_thumbnail(self, path: str, image: QImage, _size: QSize):
         icon = QIcon(QPixmap.fromImage(image))
         for top in self._top_items():
             for child in self._children(top):
@@ -422,8 +426,7 @@ class DuplicateScanDialog(QDialog):
 
     def _stop_loader(self):
         if self._loader:
-            self._loader.cancel()
-            self._loader.wait(600)
+            self._loader.shutdown()
             self._loader = None
 
     def _top_items(self) -> List[QTreeWidgetItem]:

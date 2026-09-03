@@ -40,6 +40,13 @@ class ConfigManager:
         # ── Duplicates / rejected images ───────────────────────────────
         "duplicate_sensitivity": 1,           # index into duplicate_finder.SENSITIVITY
         "rejected_directory": "",             # blank -> dataset root, else image folder
+        # ── Annotation task — viewer & labelling behaviour ─────────────
+        "zoom_locked": False,                 # keep zoom/pan across images
+        "annotation_sticky_label": False,     # reuse last label, skip the dialog
+        "annotation_recent_labels": [],       # quick-pick list (most recent first)
+        "annotation_max_boxes": 1,            # boxes allowed per image
+        "image_cache_mb": 384,                # full-res pixmap cache budget
+        "resume_session": True,               # offer to restore the last queue
     }
 
     def __init__(self):
@@ -92,9 +99,64 @@ class ConfigManager:
     def get(self, key: str, default: Any = None) -> Any:
         return self._config.get(key, default)
 
-    def set(self, key: str, value: Any) -> None:
+    def set(self, key: str, value: Any, persist: bool = True) -> None:
+        """persist=False keeps it in memory only — the caller saves later."""
+        if self._config.get(key) == value and persist:
+            return                      # no disk write for a no-op change
         self._config[key] = value
-        self.save()
+        if persist:
+            self.save()
+
+    # ------------------------------------------------------------------ #
+    #  Annotation task — viewer & labelling behaviour                      #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def zoom_locked(self) -> bool:
+        return bool(self._config.get("zoom_locked", False))
+
+    @zoom_locked.setter
+    def zoom_locked(self, locked: bool) -> None:
+        self.set("zoom_locked", bool(locked))
+
+    @property
+    def annotation_sticky_label(self) -> bool:
+        return bool(self._config.get("annotation_sticky_label", False))
+
+    @annotation_sticky_label.setter
+    def annotation_sticky_label(self, enabled: bool) -> None:
+        self.set("annotation_sticky_label", bool(enabled))
+
+    @property
+    def annotation_recent_labels(self) -> List[str]:
+        val = self._config.get("annotation_recent_labels", [])
+        return [str(v) for v in val] if isinstance(val, list) else []
+
+    @annotation_recent_labels.setter
+    def annotation_recent_labels(self, labels: List[str]) -> None:
+        self.set("annotation_recent_labels", [str(l) for l in labels][:12])
+
+    @property
+    def annotation_max_boxes(self) -> int:
+        try:
+            return max(1, int(self._config.get("annotation_max_boxes", 1)))
+        except (TypeError, ValueError):
+            return 1
+
+    @property
+    def image_cache_mb(self) -> int:
+        try:
+            return max(64, int(self._config.get("image_cache_mb", 384)))
+        except (TypeError, ValueError):
+            return 384
+
+    @property
+    def resume_session(self) -> bool:
+        return bool(self._config.get("resume_session", True))
+
+    @resume_session.setter
+    def resume_session(self, enabled: bool) -> None:
+        self.set("resume_session", bool(enabled))
 
     # ------------------------------------------------------------------ #
     #  Typed Properties                                                    #
