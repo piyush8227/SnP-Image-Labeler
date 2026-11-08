@@ -17,6 +17,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from core import theme
+
 from core.segregation_manager import (
     SPLITS, SPLIT_LABELS, class_folder_name, sanitize_class_name,
 )
@@ -61,7 +63,7 @@ class ClassRow(QWidget):
             btn = QPushButton(SPLIT_LABELS[split][:5])
             btn.setObjectName("split_btn")
             btn.setCheckable(True)
-            btn.setFixedHeight(22)
+            btn.setMinimumHeight(theme.px(22))
             btn.setMinimumWidth(44)
             btn.setToolTip(f"{SPLIT_LABELS[split]} → {class_folder_name(self.class_name)}/{split}/")
             btn.clicked.connect(lambda _, s=split: self._on_split_clicked(s))
@@ -236,7 +238,7 @@ class SegregationPanel(QWidget):
         btn_manage.setToolTip("Add / rename / reorder classes")
         btn_manage.clicked.connect(lambda _: self.manage_classes_requested.emit())
         for b in (btn_add, btn_manage):
-            b.setFixedHeight(26)
+            b.setMinimumHeight(theme.px(26))
             # Ignored width policy: let the buttons shrink with the panel
             b.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         btn_row.addWidget(btn_add)
@@ -289,7 +291,7 @@ class SegregationPanel(QWidget):
 
         self._remove_btn = QPushButton("Remove from dataset")
         self._remove_btn.setObjectName("queue_clear_btn")
-        self._remove_btn.setFixedHeight(24)
+        self._remove_btn.setMinimumHeight(theme.px(24))
         self._remove_btn.setEnabled(False)
         self._remove_btn.setToolTip("Delete the copies made for this image")
         self._remove_btn.clicked.connect(lambda _: self.unassign_requested.emit())

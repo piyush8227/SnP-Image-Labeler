@@ -26,6 +26,8 @@ from PyQt5.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+from core import theme
+
 from core.duplicate_finder import (
     DEFAULT_SENSITIVITY, SENSITIVITY, Signature, build_signature,
     group_duplicates, group_headline, human_size, summarise,
@@ -196,7 +198,7 @@ class DuplicateScanDialog(QDialog):
         self._progress = QProgressBar()
         self._progress.setTextVisible(True)
         self._progress.setVisible(False)
-        self._progress.setFixedHeight(16)
+        self._progress.setMinimumHeight(theme.px(16))
         layout.addWidget(self._progress)
 
         self._summary = QLabel(
@@ -210,7 +212,7 @@ class DuplicateScanDialog(QDialog):
         self._tree.setObjectName("dup_tree")
         self._tree.setColumnCount(4)
         self._tree.setHeaderLabels(["Image", "Folder", "Size", "Status"])
-        self._tree.setIconSize(QSize(THUMB_PX, THUMB_PX))
+        self._tree.setIconSize(QSize(theme.px(THUMB_PX), theme.px(THUMB_PX)))
         self._tree.setRootIsDecorated(True)
         self._tree.setUniformRowHeights(False)
         self._tree.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -527,7 +529,7 @@ class DuplicateScanDialog(QDialog):
 
         picture = QLabel()
         picture.setAlignment(Qt.AlignCenter)
-        picture.setFixedSize(PREVIEW_PX, PREVIEW_PX)
+        picture.setFixedSize(theme.px(PREVIEW_PX), theme.px(PREVIEW_PX))
         picture.setObjectName(
             "dup_preview_current" if (selected and selected.path == member.path)
             else "dup_preview_tile"
@@ -544,7 +546,7 @@ class DuplicateScanDialog(QDialog):
         name = QLabel(member.name)
         name.setObjectName("empty_label")
         name.setAlignment(Qt.AlignCenter)
-        name.setFixedWidth(PREVIEW_PX)
+        name.setFixedWidth(theme.px(PREVIEW_PX))
         name.setToolTip(member.path)
         metrics = name.fontMetrics()
         name.setText(metrics.elidedText(member.name, Qt.ElideMiddle, PREVIEW_PX - 6))

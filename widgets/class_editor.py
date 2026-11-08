@@ -1,7 +1,7 @@
 """
 SnP Image Labeler - Class Editor
 Dialog for managing the segregation class list (add / rename / delete / reorder).
-Mirrors the interaction pattern of FieldEditorDialog.
+Also used, with a different title, to manage the annotation label list.
 """
 
 from typing import List, Optional
@@ -11,6 +11,8 @@ from PyQt5.QtWidgets import (
     QDialog, QDialogButtonBox, QHBoxLayout, QInputDialog, QLabel,
     QListWidget, QMessageBox, QPushButton, QVBoxLayout,
 )
+
+from core import theme
 
 from core.segregation_manager import class_folder_name, sanitize_class_name
 
@@ -59,7 +61,7 @@ class ClassEditorDialog(QDialog):
         for b in (self._btn_add, self._btn_edit, self._btn_del):
             b.setMinimumHeight(28)
         for b in (self._btn_up, self._btn_down):
-            b.setFixedWidth(32)
+            b.setMinimumWidth(theme.px(32))
             b.setMinimumHeight(28)
         self._btn_add.clicked.connect(lambda _: self._add())
         self._btn_edit.clicked.connect(lambda _: self._rename())

@@ -28,6 +28,7 @@ Keyboard
 """
 
 import inspect
+import json
 import os
 import sys
 import time
@@ -44,9 +45,11 @@ from PyQt5.QtWidgets import (
     QAbstractSpinBox, QAction, QApplication, QComboBox, QFileDialog, QLabel,
     QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressDialog,
     QShortcut, QSplitter, QStackedWidget, QStatusBar, QTextEdit, QToolBar,
-    QVBoxLayout, QHBoxLayout, QFrame, QTabWidget, QWidget,
+    QVBoxLayout, QHBoxLayout, QFrame, QTabWidget, QWidget, QSizePolicy,
+    QCheckBox, QActionGroup, QMenu,
 )
 
+from core import theme
 from core.config_manager     import ConfigManager
 from core.duplicate_finder   import DEFAULT_SENSITIVITY
 from core.label_index        import LabelIndex, ReviewFlags
@@ -64,9 +67,8 @@ from widgets.duplicate_dialog import (
 from widgets.duplicate_scan_dialog import DuplicateScanDialog
 from widgets.image_queue     import DONE, FLAGGED, PENDING, ImageQueuePanel
 from widgets.review_grid     import ReviewGridDialog
-from widgets.telemetry_panel  import TelemetryPanel
+from widgets.label_panel     import LabelPanel
 from widgets.bbox_panel      import BBoxPanel
-from widgets.field_editor    import FieldEditorDialog
 from widgets.segregation_panel import SegregationPanel
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif", ".webp"}
@@ -75,7 +77,8 @@ IMG_FILTER     = "Images (*.jpg *.jpeg *.png *.bmp *.gif *.tiff *.tif *.webp)"
 TASK_ANNOTATION  = "annotation"
 TASK_SEGREGATION = "segregation"
 
-BBOX_FIELD   = "currency_country_bounding_box"
+BOXES_FIELD  = "boxes"                       # new: a list of labelled boxes
+BBOX_FIELD   = "currency_country_bounding_box"   # legacy single-box key, read only
 NAV_SETTLE_MS = 70          # coalesce held-down Next/Prev before decoding
 PREFETCH_AHEAD = 2
 PREFETCH_BEHIND = 1
@@ -215,10 +218,12 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1150, 700)
 
         self._build_ui()
+        self._create_actions()
+        self._build_menubar()
         self._build_toolbar()
         self._build_statusbar()
         self._bind_shortcuts()
-        self._load_fields()
+        self._load_labels()
         self._load_segregation_settings()
         self._restore_geometry()
         self._apply_task(self._task, initial=True)
@@ -244,8 +249,8 @@ class MainWindow(QMainWindow):
 
         # ── Left: Image Queue ─────────────────────────────────────
         self._queue = ImageQueuePanel()
-        self._queue.setMinimumWidth(200)
-        self._queue.setMaximumWidth(320)
+        self._queue.setMinimumWidth(theme.px(200))
+        self._queue.setMaximumWidth(theme.px(320))
         self._queue.image_selected.connect(self._on_queue_selection)
         self._queue.remove_requested.connect(self._remove_from_queue)
         self._queue.delete_requested.connect(self._delete_image)
@@ -271,7 +276,7 @@ class MainWindow(QMainWindow):
         # Info bar
         info_bar = QFrame()
         info_bar.setObjectName("info_bar")
-        info_bar.setFixedHeight(30)
+        info_bar.setMinimumHeight(theme.px(30))
         ib = QHBoxLayout(info_bar)
         ib.setContentsMargins(10, 0, 10, 0)
         ib.setSpacing(12)
@@ -291,7 +296,7 @@ class MainWindow(QMainWindow):
 
         self._lbl_zoom = QLabel("100%")
         self._lbl_zoom.setObjectName("info_label")
-        self._lbl_zoom.setFixedWidth(55)
+        self._lbl_zoom.setMinimumWidth(theme.px(55))
         self._lbl_zoom.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         ib.addWidget(self._lbl_zoom)
 
@@ -301,17 +306,18 @@ class MainWindow(QMainWindow):
         # ── Right: task-dependent stack ───────────────────────────
         self._right_stack = QStackedWidget()
         self._right_stack.setObjectName("right_stack")
-        self._right_stack.setMinimumWidth(300)
-        self._right_stack.setMaximumWidth(420)
+        self._right_stack.setMinimumWidth(theme.px(300))
+        self._right_stack.setMaximumWidth(theme.px(420))
 
         # Page 0 — Annotation task (Telemetry + Annotations tabs)
         self._right_tabs = QTabWidget()
         self._right_tabs.setObjectName("right_tabs")
 
-        self._telemetry = TelemetryPanel()
-        self._telemetry.save_requested.connect(self._manual_save)
-        self._telemetry.values_changed.connect(self._on_telemetry_edited)
-        self._right_tabs.addTab(self._telemetry, "Telemetry")
+        self._labels_panel = LabelPanel()
+        self._labels_panel.save_requested.connect(self._manual_save)
+        self._labels_panel.manage_requested.connect(self._manage_labels)
+        self._labels_panel.label_chosen.connect(self._on_label_chosen)
+        self._right_tabs.addTab(self._labels_panel, "Labels")
 
         self._bbox_panel = BBoxPanel()
         self._bbox_panel.box_select_requested.connect(self._on_panel_box_select)
@@ -335,150 +341,462 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         rl.addWidget(splitter)
 
+    # ================================================================== #
+    #  Header - menu bar + toolbar                                         #
+    # ================================================================== #
+    #
+    # Every command lives on the menu bar. Menus are pop-ups: they never run
+    # out of horizontal room, they grow with the font, and Qt scrolls them when
+    # they are too tall - so nothing becomes unreachable at 200%. The toolbar
+    # is a convenience layer carrying the actions used constantly, and it is
+    # free to overflow because the menu bar is the guarantee.
+
+    @staticmethod
+    def _with_hint(text, hint):
+        """
+        "Import Images\tCtrl+O" - Qt right-aligns the part after the tab.
+
+        The hint is displayed, not registered. The real bindings live in
+        _bind_shortcuts and the eventFilter; registering them a second time
+        here would fire some commands twice per press.
+        """
+        return (text + "\t" + hint) if hint else text
+
+    def _make_action(self, text, tip, slot, hint="", checkable=False):
+        action = QAction(self._with_hint(text, hint), self)
+        action.setToolTip(tip)
+        if checkable:
+            action.setCheckable(True)
+        if slot is not None:
+            action.triggered.connect(slot)
+        return action
+
+    def _create_actions(self):
+        """Build every command once; the menus and the toolbar share them."""
+        self._annot_only: List[QAction] = []
+        self._seg_only:   List[QAction] = []
+        mk = self._make_action
+
+        # ---- Task ----------------------------------------------------
+        self._act_task_annot = mk("Annotation Task",
+                                  "Draw labelled bounding boxes  (Ctrl+1)",
+                                  lambda: self._set_task(TASK_ANNOTATION),
+                                  "Ctrl+1", checkable=True)
+        self._act_task_seg = mk("Segregation Task",
+                                "Sort images into class folders  (Ctrl+2)",
+                                lambda: self._set_task(TASK_SEGREGATION),
+                                "Ctrl+2", checkable=True)
+
+        # ---- File ----------------------------------------------------
+        self._act_import  = mk("Import Images or Folder...",
+                               "Import images or a whole folder  (Ctrl+O)",
+                               self._import, "Ctrl+O")
+        self._act_export  = mk("Export Label File...",
+                               "Export the label file to a chosen location",
+                               self._export)
+        self._act_outdir  = mk("Set Output Directory...",
+                               "Where label files are written",
+                               self._set_output_dir)
+        self._act_dsdir   = mk("Set Dataset Directory...",
+                               "Dataset root where class folders are created",
+                               self._set_dataset_dir)
+        self._act_opends  = mk("Open Dataset Folder",
+                               "Open the dataset root in the file browser",
+                               self._open_dataset_dir)
+        self._act_openrec = mk("Open Processed Record",
+                               "Open processed_images.csv",
+                               self._open_record_file)
+        self._act_exit    = mk("Exit", "Close SnP Image Labeler", self.close)
+        self._annot_only += [self._act_export, self._act_outdir]
+        self._seg_only   += [self._act_dsdir, self._act_opends, self._act_openrec]
+
+        # Export format as a radio group, replacing the toolbar combo.
+        self._fmt_actions: Dict[str, QAction] = {}
+        self._fmt_group = QActionGroup(self)
+        self._fmt_group.setExclusive(True)
+        for name in ("CSV", "JSON"):
+            action = mk(name, "Write label files as " + name, None, checkable=True)
+            action.setChecked(self._config.export_format.upper() == name)
+            action.triggered.connect(lambda _c, n=name: self._on_format_changed(n))
+            self._fmt_group.addAction(action)
+            self._fmt_actions[name] = action
+
+        # ---- Edit ----------------------------------------------------
+        self._act_undo    = mk("Undo", "Undo the last box change  (Ctrl+Z)",
+                               self._undo_action, "Ctrl+Z")
+        self._act_redo    = mk("Redo", "Redo  (Ctrl+Y)", self._redo_action, "Ctrl+Y")
+        self._act_delbox  = mk("Delete Selected Box",
+                               "Delete the selected box  (Del)",
+                               self._delete_selected_box, "Del")
+        self._act_clearbx = mk("Clear All Boxes",
+                               "Remove every box on this image",
+                               self._clear_all_boxes)
+        self._act_flag    = mk("Flag for Review",
+                               "Flag this image for review  (Ctrl+F)",
+                               self._toggle_flag, "Ctrl+F", checkable=True)
+        self._act_delete  = mk("Delete Image",
+                               "Move this image into _rejected  (Shift+Del)",
+                               self._delete_current_image, "Shift+Del")
+        self._annot_only += [self._act_undo, self._act_redo,
+                             self._act_delbox, self._act_clearbx]
+
+        # ---- View ----------------------------------------------------
+        self._act_zoom_in  = mk("Zoom In", "Zoom in  (Ctrl++)",
+                                self._zoom_in, "Ctrl++")
+        self._act_zoom_out = mk("Zoom Out", "Zoom out  (Ctrl+-)",
+                                self._zoom_out, "Ctrl+-")
+        self._act_fit      = mk("Fit to Window", "Fit the image to the window  (F)",
+                                self._fit, "F")
+        self._act_zoom_lock = mk("Lock Zoom",
+                                 "Keep this zoom and pan on the next image  (Ctrl+L)",
+                                 self._toggle_zoom_lock, "Ctrl+L", checkable=True)
+        self._act_refresh  = mk("Reload Image", "Re-read this image from disk  (R)",
+                                self._refresh, "R")
+        self._act_grid     = mk("Review Grid...",
+                                "Contact sheet of the queue  (Ctrl+G)",
+                                self._open_review_grid, "Ctrl+G")
+
+        # ---- Tools ---------------------------------------------------
+        self._act_dupes   = mk("Find Duplicates...",
+                               "Find the same picture stored more than once  (Ctrl+D)",
+                               self._find_duplicates, "Ctrl+D")
+        self._act_labels  = mk("Manage Labels...",
+                               "Add / rename / reorder the box labels",
+                               self._manage_labels)
+        self._act_classes = mk("Manage Classes...",
+                               "Add / rename / reorder segregation classes",
+                               self._manage_classes)
+        self._act_assign  = mk("Assign to Classes",
+                               "Copy this image into the selected class folders  (Enter)",
+                               self._seg_assign, "Enter")
+        self._annot_only.append(self._act_labels)
+        self._seg_only   += [self._act_classes, self._act_assign]
+
+        self._act_nav = mk("Navigate Mode", "Pan and zoom  (N)",
+                           self._mode_navigate, "N", checkable=True)
+        self._act_nav.setChecked(True)
+        self._act_annot = mk("Annotate Mode", "Draw bounding boxes  (B)",
+                             self._mode_annotate, "B", checkable=True)
+        self._act_sticky = mk("Sticky Label",
+                              "Reuse the last label instead of asking every time",
+                              self._toggle_sticky_label, checkable=True)
+        self._annot_only += [self._act_nav, self._act_annot, self._act_sticky]
+
+        # ---- Appearance ----------------------------------------------
+        self._act_dark = mk("Dark Theme",
+                            "Switch between the light and dark theme  (Ctrl+Shift+D)",
+                            self._on_dark_action, "Ctrl+Shift+D", checkable=True)
+        self._act_dark.setChecked(self._config.ui_theme == theme.DARK)
+
+        self._scale_actions: Dict[int, QAction] = {}
+        self._scale_group = QActionGroup(self)
+        self._scale_group.setExclusive(True)
+        for pct in theme.SCALES:
+            action = mk(str(pct) + "%", "Scale the interface to " + str(pct) + "%",
+                        None, checkable=True)
+            action.triggered.connect(lambda _c, value=pct: self._set_scale(value))
+            self._scale_group.addAction(action)
+            self._scale_actions[pct] = action
+
+        self._act_shortcuts = mk("Keyboard Shortcuts...",
+                                 "Every shortcut in one list", self._show_shortcuts)
+
+    def _build_menubar(self):
+        bar = self.menuBar()
+        bar.setObjectName("main_menubar")
+        bar.setNativeMenuBar(False)      # keep it in the window on every OS
+
+        menu = bar.addMenu("&File")
+        menu.addAction(self._act_import)
+        menu.addSeparator()
+        fmt = menu.addMenu("Label Format")
+        for action in self._fmt_actions.values():
+            fmt.addAction(action)
+        menu.addAction(self._act_export)
+        menu.addSeparator()
+        menu.addAction(self._act_outdir)
+        menu.addAction(self._act_dsdir)
+        menu.addAction(self._act_opends)
+        menu.addAction(self._act_openrec)
+        menu.addSeparator()
+        menu.addAction(self._act_exit)
+
+        menu = bar.addMenu("&Edit")
+        menu.addAction(self._act_undo)
+        menu.addAction(self._act_redo)
+        menu.addSeparator()
+        menu.addAction(self._act_delbox)
+        menu.addAction(self._act_clearbx)
+        menu.addSeparator()
+        menu.addAction(self._act_flag)
+        menu.addAction(self._act_delete)
+
+        menu = bar.addMenu("&View")
+        menu.addAction(self._act_zoom_in)
+        menu.addAction(self._act_zoom_out)
+        menu.addAction(self._act_fit)
+        menu.addAction(self._act_zoom_lock)
+        menu.addSeparator()
+        menu.addAction(self._act_refresh)
+        menu.addAction(self._act_grid)
+        menu.addSeparator()
+        menu.addAction(self._act_dark)
+        scale = menu.addMenu("Interface Scale")
+        for action in self._scale_actions.values():
+            scale.addAction(action)
+
+        menu = bar.addMenu("&Task")
+        menu.addAction(self._act_task_annot)
+        menu.addAction(self._act_task_seg)
+
+        menu = bar.addMenu("T&ools")
+        menu.addAction(self._act_dupes)
+        menu.addSeparator()
+        menu.addAction(self._act_labels)
+        menu.addAction(self._act_classes)
+        menu.addSeparator()
+        menu.addAction(self._act_nav)
+        menu.addAction(self._act_annot)
+        menu.addAction(self._act_sticky)
+        menu.addSeparator()
+        menu.addAction(self._act_assign)
+
+        menu = bar.addMenu("&Help")
+        menu.addAction(self._act_shortcuts)
+
     def _build_toolbar(self):
+        """
+        The frequent actions only.
+
+        This set still fits across the window at 200%; everything else is one
+        menu click away, which is why the toolbar no longer has to carry all
+        27 commands and silently drop two thirds of them.
+        """
         tb = QToolBar("Toolbar")
         tb.setObjectName("main_toolbar")
         tb.setMovable(False)
-        tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        tb.setFloatable(False)
+        tb.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        tb.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.addToolBar(tb)
+        self._toolbar = tb
+        self._tb_proxies: List[QAction] = []
 
-        def act(label, tip, slot):
-            a = QAction(label, self)
-            a.setToolTip(tip)
-            a.triggered.connect(slot)
-            tb.addAction(a)
-            return a
+        def proxy(source, label, danger=False):
+            """
+            A toolbar entry mirroring a menu action.
 
-        self._annot_only: List[QAction] = []
-        self._seg_only:   List[QAction] = []
+            The toolbar wants "Import"; the menu wants "Import Images or
+            Folder...  Ctrl+O". A proxy keeps both readable while the menu
+            action stays the single source of truth for checked / visible /
+            enabled state, so switching task still hides the right buttons.
+            """
+            mirror = QAction(label, self)
+            mirror.setToolTip(source.toolTip())
+            mirror.setCheckable(source.isCheckable())
+            mirror.setChecked(source.isChecked())
+            mirror.setVisible(source.isVisible())
+            mirror.setEnabled(source.isEnabled())
+            mirror.triggered.connect(source.trigger)
+            if source.isCheckable():
+                source.toggled.connect(mirror.setChecked)
+            source.changed.connect(
+                lambda src=source, dst=mirror: (dst.setVisible(src.isVisible()),
+                                                dst.setEnabled(src.isEnabled())))
+            tb.addAction(mirror)
+            if danger:
+                button = tb.widgetForAction(mirror)
+                if button is not None:
+                    button.setObjectName("danger_tool_btn")
+            self._tb_proxies.append(mirror)
+            return mirror
 
-        # ── Task switch ───────────────────────────────────────────
-        tb.addWidget(QLabel("  Task: "))
-        self._act_task_annot = QAction("Annotation", self)
-        self._act_task_annot.setToolTip("Annotation task — telemetry + bounding box  (Ctrl+1)")
-        self._act_task_annot.setCheckable(True)
-        self._act_task_annot.triggered.connect(lambda: self._set_task(TASK_ANNOTATION))
-        tb.addAction(self._act_task_annot)
-
-        self._act_task_seg = QAction("Segregation", self)
-        self._act_task_seg.setToolTip("Segregation task — sort images into class folders  (Ctrl+2)")
-        self._act_task_seg.setCheckable(True)
-        self._act_task_seg.triggered.connect(lambda: self._set_task(TASK_SEGREGATION))
-        tb.addAction(self._act_task_seg)
-
-        tb.addSeparator()
-        act("Import",  "Import images or folder  (Ctrl+O)", self._import)
-        act("Find Duplicates",
-            "Scan for the same picture stored more than once  (Ctrl+D)",
-            self._find_duplicates)
-        act("Review Grid",
-            "Contact sheet of the queue with saved boxes drawn on  (Ctrl+G)",
-            self._open_review_grid)
-        self._act_delete = act(
-            "Delete Image",
-            "Move this image out of the working set into _rejected  (Shift+Del)",
-            self._delete_current_image)
-        delete_button = tb.widgetForAction(self._act_delete)
-        if delete_button is not None:
-            delete_button.setObjectName("danger_tool_btn")
-        tb.addSeparator()
-        act("Prev",    "Previous image  (A / Left)",         self._prev)
-        act("Next",    "Next image  (D / Right)",            self._next)
-        self._act_flag = QAction("Flag", self)
-        self._act_flag.setToolTip("Flag this image for review  (Ctrl+F)")
-        self._act_flag.setCheckable(True)
-        self._act_flag.triggered.connect(self._toggle_flag)
-        tb.addAction(self._act_flag)
-        tb.addSeparator()
-        act("Zoom+",   "Zoom In  (Ctrl++)",                  self._zoom_in)
-        act("Zoom-",   "Zoom Out  (Ctrl+-)",                 self._zoom_out)
-        act("Fit",     "Fit to window  (F)",                 self._fit)
-
-        self._act_zoom_lock = QAction("Lock Zoom", self)
-        self._act_zoom_lock.setToolTip(
-            "Keep the current zoom and pan when moving to the next image  (Ctrl+L)")
-        self._act_zoom_lock.setCheckable(True)
-        self._act_zoom_lock.triggered.connect(self._toggle_zoom_lock)
-        tb.addAction(self._act_zoom_lock)
-
-        act("Refresh", "Reload this image from disk  (R)",   self._refresh)
+        tb.addWidget(QLabel(" Task: "))
+        proxy(self._act_task_annot, "Annotation")
+        proxy(self._act_task_seg,   "Segregation")
         tb.addSeparator()
 
-        # ── Annotation-only controls ──────────────────────────────
-        self._annot_only.append(
-            act("Undo", "Undo the last box change  (Ctrl+Z)", self._undo_action))
-        self._annot_only.append(
-            act("Redo", "Redo  (Ctrl+Y)", self._redo_action))
-        self._annot_only.append(tb.addSeparator())
+        proxy(self._act_import, "Import")
+        proxy(self._act_dupes,  "Duplicates")
+        tb.addSeparator()
 
-        self._annot_only.append(tb.addWidget(QLabel("  Format: ")))
-        self._fmt_combo = QComboBox()
-        self._fmt_combo.addItems(["CSV", "JSON"])
-        self._fmt_combo.setCurrentText(self._config.export_format.upper())
-        self._fmt_combo.setFixedWidth(78)
-        self._fmt_combo.currentTextChanged.connect(self._on_format_changed)
-        self._annot_only.append(tb.addWidget(self._fmt_combo))
+        proxy(self._act_nav,    "Navigate")
+        proxy(self._act_annot,  "Annotate")
+        proxy(self._act_assign, "Assign")
+        tb.addSeparator()
 
-        self._annot_only.append(
-            act("Export", "Export label file to custom location", self._export))
-        self._annot_only.append(tb.addSeparator())
-        self._annot_only.append(
-            act("Output Dir", "Set label output directory", self._set_output_dir))
-        self._annot_only.append(
-            act("Manage Fields", "Add / edit telemetry fields", self._manage_fields))
-        self._annot_only.append(tb.addSeparator())
+        proxy(self._act_zoom_in,  "Zoom+")
+        proxy(self._act_zoom_out, "Zoom-")
+        proxy(self._act_fit,      "Fit")
+        tb.addSeparator()
 
-        self._annot_only.append(tb.addWidget(QLabel("  Mode: ")))
-        self._act_nav = QAction("Navigate", self)
-        self._act_nav.setToolTip("Navigate mode — pan & zoom  (N)")
-        self._act_nav.setCheckable(True)
-        self._act_nav.setChecked(True)
-        self._act_nav.triggered.connect(self._mode_navigate)
-        tb.addAction(self._act_nav)
-        self._annot_only.append(self._act_nav)
+        proxy(self._act_flag,   "Flag")
+        proxy(self._act_delete, "Delete", danger=True)
 
-        self._act_annot = QAction("Annotate", self)
-        self._act_annot.setToolTip("Annotate mode — draw bounding box  (B)")
-        self._act_annot.setCheckable(True)
-        self._act_annot.setChecked(False)
-        self._act_annot.triggered.connect(self._mode_annotate)
-        tb.addAction(self._act_annot)
-        self._annot_only.append(self._act_annot)
+    # ================================================================== #
+    #  Appearance — theme + UI scale                                       #
+    # ================================================================== #
 
-        self._act_sticky = QAction("Sticky Label", self)
-        self._act_sticky.setToolTip(
-            "Reuse the last label for new boxes instead of asking every time")
-        self._act_sticky.setCheckable(True)
-        self._act_sticky.triggered.connect(self._toggle_sticky_label)
-        tb.addAction(self._act_sticky)
-        self._annot_only.append(self._act_sticky)
+    def _apply_appearance(self):
+        """
+        Re-theme and re-scale the running app.
 
-        self._annot_only.append(tb.addSeparator())
-        self._annot_only.append(
-            act("Del Box", "Delete selected box  (Del)", self._delete_selected_box))
+        The stylesheet and the app font come from core.theme; the widgets that
+        paint themselves (bounding boxes, thumbnails, the review grid) cannot be
+        reached by a stylesheet, so they are handed the new palette explicitly.
+        """
+        app = QApplication.instance()
+        if app is None:
+            return
+        mode, scale = self._config.ui_theme, self._config.ui_scale
+        theme.apply(app, mode, scale)
 
-        # ── Segregation-only controls ─────────────────────────────
-        self._seg_only.append(
-            act("Dataset Dir", "Set the dataset root where class folders are created",
-                self._set_dataset_dir))
-        self._seg_only.append(
-            act("Manage Classes", "Add / rename / reorder segregation classes",
-                self._manage_classes))
-        self._seg_only.append(tb.addSeparator())
-        self._seg_only.append(
-            act("Assign", "Copy this image into the selected class folders  (Enter)",
-                self._seg_assign))
-        self._seg_only.append(
-            act("Open Dataset", "Open the dataset folder in the file browser",
-                self._open_dataset_dir))
-        self._seg_only.append(
-            act("Open Record", "Open processed_images.csv — the log of every processed image",
-                self._open_record_file))
+        # A widget whose C++ side has already gone raises RuntimeError on any
+        # access, including getattr. Re-theming must not be the thing that
+        # takes the window down, so each one is attempted independently.
+        for widget in (self._viewer, self._queue, self._seg_panel,
+                       self._bbox_panel, self._labels_panel,
+                       self._grid_dialog, self._dup_dialog):
+            if widget is None:
+                continue
+            try:
+                setter = getattr(widget, "apply_theme", None)
+                if callable(setter):
+                    setter(mode, scale)
+            except RuntimeError:
+                continue                  # dialog already closed and deleted
+
+        # Panel widths are pixel numbers, so they have to be recomputed or the
+        # panels keep their 100% size and clip their own (now larger) contents.
+        self._queue.setMinimumWidth(theme.px(200))
+        self._queue.setMaximumWidth(theme.px(320))
+        self._right_stack.setMinimumWidth(theme.px(300))
+        self._right_stack.setMaximumWidth(theme.px(420))
+        self._sync_scale_combo()
+        self._sync_appearance_menu()
+
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def _sync_appearance_menu(self):
+        """Mirror the live theme and scale onto the View menu."""
+        dark = getattr(self, "_act_dark", None)
+        if dark is not None:
+            dark.blockSignals(True)
+            dark.setChecked(self._config.ui_theme == theme.DARK)
+            dark.blockSignals(False)
+        pct = int(round(self._config.ui_scale * 100))
+        for value, action in getattr(self, "_scale_actions", {}).items():
+            action.blockSignals(True)
+            action.setChecked(value == pct)
+            action.blockSignals(False)
+
+    def _sync_scale_combo(self):
+        """Keep the status-bar combo showing the scale actually in force."""
+        combo = getattr(self, "_scale_combo", None)
+        if combo is None:
+            return
+        pct = int(round(self._config.ui_scale * 100))
+        at = combo.findData(pct)
+        if at < 0:
+            combo.addItem(f"{pct}%", pct)
+            at = combo.findData(pct)
+        if at != combo.currentIndex():
+            combo.blockSignals(True)
+            combo.setCurrentIndex(at)
+            combo.blockSignals(False)
+
+    @_safe_slot
+    def _on_dark_action(self, *_args):
+        """View > Dark Theme."""
+        self._chk_dark.blockSignals(True)
+        self._chk_dark.setChecked(self._act_dark.isChecked())
+        self._chk_dark.blockSignals(False)
+        self._toggle_theme()
+
+    @_safe_slot
+    def _set_scale(self, pct):
+        """View > Interface Scale > N%."""
+        self._config.ui_scale = float(pct) / 100.0
+        self._apply_appearance()
+        self._set_status("Interface scale: " + str(pct) + "%")
+
+    @_safe_slot
+    def _show_shortcuts(self):
+        """Help > Keyboard Shortcuts - the menus show the common ones too."""
+        rows = [
+            ("D / Right", "Next image"),
+            ("A / Left", "Previous image"),
+            ("Ctrl+O", "Import images or a folder"),
+            ("Ctrl+S", "Save label (Assign in Segregation)"),
+            ("Ctrl+1 / Ctrl+2", "Annotation / Segregation task"),
+            ("N / B", "Navigate / Annotate mode"),
+            ("1 - 9", "Quick label (Train/Test/Val in Segregation)"),
+            ("Del", "Delete the selected box"),
+            ("Alt+Arrows", "Nudge the selected box (Shift for 10 px)"),
+            ("Space / middle-drag", "Pan"),
+            ("Ctrl+Z / Ctrl+Y", "Undo / Redo"),
+            ("Ctrl+F", "Flag for review"),
+            ("Ctrl+G", "Review grid"),
+            ("Ctrl+D", "Find duplicates"),
+            ("Ctrl+L", "Lock zoom"),
+            ("F", "Fit to window"),
+            ("R", "Reload the image"),
+            ("Shift+Del", "Delete image (move to _rejected)"),
+            ("Enter", "Assign and next (Segregation)"),
+            ("Ctrl+Shift+D", "Toggle the dark theme"),
+            ("Ctrl+Shift+ +/-", "Scale the interface up / down"),
+        ]
+        width = max(len(key) for key, _ in rows)
+        body = "\n".join(key.ljust(width) + "   " + what for key, what in rows)
+        box = QMessageBox(self)
+        box.setWindowTitle("Keyboard Shortcuts")
+        box.setText("Keyboard Shortcuts")
+        box.setInformativeText("<pre>" + body + "</pre>")
+        box.exec_()
+
+    @_safe_slot
+    def _toggle_theme(self, *_args):
+        mode = theme.DARK if self._chk_dark.isChecked() else theme.LIGHT
+        self._config.ui_theme = mode
+        self._apply_appearance()
+        self._set_status(f"{'Dark' if mode == theme.DARK else 'Light'} theme.")
+
+    @_safe_slot
+    def _on_scale_changed(self, _index: int):
+        pct = self._scale_combo.currentData()
+        if not pct:
+            return
+        self._config.ui_scale = float(pct) / 100.0
+        self._apply_appearance()
+        self._set_status(f"Interface scale: {pct}%")
+
+    @_safe_slot
+    def _nudge_scale(self, step: int):
+        """Ctrl+Shift+Plus / Minus — step through the preset scales."""
+        current = int(round(self._config.ui_scale * 100))
+        presets = sorted(set(theme.SCALES + [current]))
+        index = max(0, min(len(presets) - 1, presets.index(current) + step))
+        pct = presets[index]
+        if pct == current:
+            return
+        at = self._scale_combo.findData(pct)
+        if at >= 0:
+            self._scale_combo.setCurrentIndex(at)      # fires _on_scale_changed
+        else:
+            self._config.ui_scale = pct / 100.0
+            self._apply_appearance()
+            self._set_status(f"Interface scale: {pct}%")
 
     def _build_statusbar(self):
         sb = QStatusBar()
         self.setStatusBar(sb)
         self._sb_msg = QLabel("Ready — Import images to get started.")
+        # Status text must give way, not shove the controls to its right off
+        # the end of the bar when the UI is scaled up.
+        self._sb_msg.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._sb_msg.setMinimumWidth(theme.px(60))
         sb.addWidget(self._sb_msg, 1)
 
         self._sb_progress = QLabel("")
@@ -494,9 +812,40 @@ class MainWindow(QMainWindow):
         self._sb_outdir.setObjectName("outdir_label")
         sb.addPermanentWidget(self._sb_outdir)
 
+        # Appearance lives in the status bar rather than the toolbar: the
+        # toolbar already overflows at 100%, and these two are exactly the
+        # controls you need to reach when the UI is scaled awkwardly.
+        self._chk_dark = QCheckBox("Dark")
+        self._chk_dark.setObjectName("dark_toggle")
+        self._chk_dark.setToolTip("Switch between the light and dark theme  (Ctrl+Shift+D)")
+        self._chk_dark.setChecked(self._config.ui_theme == theme.DARK)
+        self._chk_dark.toggled.connect(self._toggle_theme)
+        self._chk_dark.toggled.connect(
+            lambda on: self._act_dark.setChecked(on)
+            if getattr(self, "_act_dark", None) is not None else None)
+        sb.addPermanentWidget(self._chk_dark)
+
+        self._scale_combo = QComboBox()
+        self._scale_combo.setObjectName("scale_combo")
+        self._scale_combo.setToolTip(
+            "Scale the whole interface - text, buttons and spacing"
+            "  (Ctrl+Shift+ +/-)")
+        for pct in theme.SCALES:
+            self._scale_combo.addItem(f"{pct}%", pct)
+        current = int(round(self._config.ui_scale * 100))
+        if self._scale_combo.findData(current) < 0:
+            self._scale_combo.addItem(f"{current}%", current)
+        self._scale_combo.setCurrentIndex(max(0, self._scale_combo.findData(current)))
+        self._scale_combo.currentIndexChanged.connect(self._on_scale_changed)
+        sb.addPermanentWidget(self._scale_combo)
+
     def _bind_shortcuts(self):
         # Single letters (A / D / N / B / F / R / digits) are handled in
         # eventFilter so they never steal a keystroke from a text field.
+        QShortcut(QKeySequence("Ctrl+Shift+D"), self, self._chk_dark.toggle)
+        QShortcut(QKeySequence("Ctrl+Shift++"), self, lambda: self._nudge_scale(1))
+        QShortcut(QKeySequence("Ctrl+Shift+="), self, lambda: self._nudge_scale(1))
+        QShortcut(QKeySequence("Ctrl+Shift+-"), self, lambda: self._nudge_scale(-1))
         QShortcut(QKeySequence("Left"),      self, self._prev)
         QShortcut(QKeySequence("Right"),     self, self._next)
         QShortcut(QKeySequence("Ctrl+S"),    self, self._manual_save)
@@ -659,6 +1008,8 @@ class MainWindow(QMainWindow):
         self._apply_task(task)
 
     def _apply_task(self, task: str, initial: bool = False):
+        if not initial and self._task == TASK_SEGREGATION and task != TASK_SEGREGATION:
+            self._seg_mgr.flush()      # leaving segregation: get the record on disk
         self._task = task if task in (TASK_ANNOTATION, TASK_SEGREGATION) else TASK_ANNOTATION
         self._config.active_task = self._task
         seg = self._task == TASK_SEGREGATION
@@ -975,13 +1326,11 @@ class MainWindow(QMainWindow):
         """Build and save the unified label file for the given image."""
         fmt        = self._config.export_format
         image_name = Path(path).name
-        telemetry  = self._telemetry.get_values()
-        bbox       = self._viewer.get_single_box()
+        boxes      = self._boxes_payload()
 
         values = {
             "image_name": image_name,
-            **telemetry,
-            BBOX_FIELD: bbox,
+            BOXES_FIELD:  boxes,
         }
 
         was_done = self._label_index.has(path)
@@ -993,7 +1342,8 @@ class MainWindow(QMainWindow):
                 self._queue.mark_labeled(path, True)
             if not was_done:
                 self._record_completion()
-            self._remember_box_label(bbox.get("label", ""))
+            if boxes:
+                self._remember_box_label(boxes[-1].get("label", ""))
             self._update_progress_readout()
             if not silent:
                 stem = Path(path).stem
@@ -1058,22 +1408,40 @@ class MainWindow(QMainWindow):
     #  Fields                                                              #
     # ================================================================== #
 
-    def _load_fields(self):
-        self._telemetry.load_fields(self._config.telemetry_fields)
+    def _load_labels(self):
+        """Push the configured label list into the panel and the viewer."""
+        labels = self._config.annotation_labels
+        self._labels_panel.load_labels(labels, self._viewer.label_colors)
+        self._viewer.set_label_choices(labels)
 
     @_safe_slot
-    def _manage_fields(self):
-        dlg = FieldEditorDialog(self._config.telemetry_fields, self)
+    def _manage_labels(self):
+        """Add / rename / reorder the labels boxes can be tagged with."""
+        dlg = ClassEditorDialog(self._config.annotation_labels, self)
+        dlg.setWindowTitle("Manage Labels")
         if dlg.exec_():
-            fields = dlg.get_fields()
-            self._config.telemetry_fields = fields
-            self._telemetry.load_fields(fields)
-            self._reload_current_annotation()
-            self._set_status(f"Fields updated — {len(fields)} field(s).")
+            labels = dlg.get_classes()
+            self._config.annotation_labels = labels
+            self._load_labels()
+            self._set_status(f"Labels updated — {len(labels)} label(s).")
 
-    # ================================================================== #
-    #  Mode / viewer toggles                                               #
-    # ================================================================== #
+    @_safe_slot
+    def _on_label_chosen(self, label: str):
+        """
+        A click in the Labels list: retag the selected box, else arm the label
+        for the next box drawn.
+        """
+        if self._task != TASK_ANNOTATION:
+            return
+        if self._viewer.apply_label_to_selection(label):
+            self._set_status(f"Label applied: {label}")
+        else:
+            self._viewer.set_sticky_label(True, label)
+            self._set_status(f"Next box will be labelled: {label}")
+        self._refresh_label_colors()
+
+    def _refresh_label_colors(self):
+        self._labels_panel.set_colors(self._viewer.label_colors)
 
     @_safe_slot
     def _mode_navigate(self):
@@ -1361,7 +1729,6 @@ class MainWindow(QMainWindow):
         self._nav_timer.stop()
         self._viewer.clear()
         self._bbox_panel.clear()
-        self._telemetry.load_values(None)
         self._undo.reset([])
         self._lbl_name.setText("No image loaded")
         self._lbl_dims.setText("")
@@ -1684,27 +2051,75 @@ class MainWindow(QMainWindow):
             self._refresh_seg_view()
         else:
             existing = self._label_mgr.load_label(path, self._config.export_format)
-            self._telemetry.load_values(existing)
             self._viewer.load_image(path, self._boxes_from_label(existing))
 
         self._lbl_size.setText(self._file_size_text(path))
         self._viewer.prefetch(self._neighbours())
 
+    def _boxes_payload(self) -> List[dict]:
+        """The current boxes in the order they appear, ready to serialise."""
+        out: List[dict] = []
+        for box in self._viewer.get_boxes_data():
+            out.append({
+                "label":  box.get("label", "") or "",
+                "left":   round(float(box.get("left", 0)), 2),
+                "top":    round(float(box.get("top", 0)), 2),
+                "right":  round(float(box.get("right", 0)), 2),
+                "bottom": round(float(box.get("bottom", 0)), 2),
+            })
+        return out
+
     def _boxes_from_label(self, existing: Optional[dict]) -> List[dict]:
-        """Rebuild the box list from a saved label file."""
+        """
+        Rebuild the box list from a saved label file.
+
+        Reads the current `boxes` list, and falls back to the single
+        `currency_country_bounding_box` key written by older builds so images
+        labelled before the change still open with their box intact. Nothing on
+        disk is rewritten until that image is saved again.
+        """
         if not existing:
             return []
-        bbox = existing.get(BBOX_FIELD) or {}
-        if not isinstance(bbox, dict) or bbox.get("left") is None:
-            return []
-        return [{
-            "id":     "saved",
-            "label":  bbox.get("label", "") or "",
-            "left":   bbox["left"],
-            "top":    bbox["top"],
-            "right":  bbox["right"],
-            "bottom": bbox["bottom"],
-        }]
+
+        raw = existing.get(BOXES_FIELD)
+        if isinstance(raw, str):                 # CSV stores the list as JSON
+            try:
+                raw = json.loads(raw)
+            except (ValueError, TypeError):
+                raw = None
+
+        boxes: List[dict] = []
+        if isinstance(raw, list):
+            for index, item in enumerate(raw):
+                if not isinstance(item, dict) or item.get("left") is None:
+                    continue
+                boxes.append({
+                    "id":     item.get("id") or f"saved{index}",
+                    "label":  item.get("label", "") or "",
+                    "left":   float(item["left"]),
+                    "top":    float(item["top"]),
+                    "right":  float(item["right"]),
+                    "bottom": float(item["bottom"]),
+                })
+            if boxes:
+                return boxes
+
+        legacy = existing.get(BBOX_FIELD)
+        if isinstance(legacy, str):
+            try:
+                legacy = json.loads(legacy)
+            except (ValueError, TypeError):
+                legacy = None
+        if isinstance(legacy, dict) and legacy.get("left") is not None:
+            return [{
+                "id":     "saved",
+                "label":  legacy.get("label", "") or "",
+                "left":   float(legacy["left"]),
+                "top":    float(legacy["top"]),
+                "right":  float(legacy["right"]),
+                "bottom": float(legacy["bottom"]),
+            }]
+        return []
 
     def _neighbours(self) -> List[str]:
         lo = max(0, self._current_index - PREFETCH_BEHIND)
@@ -1726,7 +2141,6 @@ class MainWindow(QMainWindow):
         if not path or self._task != TASK_ANNOTATION:
             return
         existing = self._label_mgr.load_label(path, self._config.export_format)
-        self._telemetry.load_values(existing)
 
     # ================================================================== #
     #  Viewer events                                                       #
@@ -1754,9 +2168,6 @@ class MainWindow(QMainWindow):
         if self._applying_undo:
             return
         self._undo.push(self._viewer.get_boxes_data())
-        self._mark_dirty()
-
-    def _on_telemetry_edited(self):
         self._mark_dirty()
 
     def _on_selection_changed(self):
@@ -1892,8 +2303,7 @@ class MainWindow(QMainWindow):
             return
         values = {
             "image_name": Path(path).name,
-            **self._telemetry.get_values(),
-            BBOX_FIELD: self._viewer.get_single_box(),
+            BOXES_FIELD: self._boxes_payload(),
         }
         if self._label_mgr.save_label_to_path(dest, values, fmt):
             self._set_status(f"Exported: {dest}")
@@ -1982,6 +2392,7 @@ class MainWindow(QMainWindow):
 
         self._nav_timer.stop()
         self._flush_autosave()
+        self._seg_mgr.flush()          # compact any appended record rows
         self._session_timer.stop()
         self._save_session()
 

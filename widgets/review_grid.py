@@ -20,6 +20,8 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QPushButton, QVBoxLayout,
 )
 
+from core import theme
+
 from core.thumbnail_cache import ThumbnailService
 from widgets.image_queue import DONE, FLAGGED, PENDING
 
@@ -102,7 +104,7 @@ class ReviewGridDialog(QDialog):
         self._list.setUniformItemSizes(True)
         self._list.setLayoutMode(QListView.Batched)
         self._list.setBatchSize(60)
-        self._list.setIconSize(QSize(CELL, CELL))
+        self._list.setIconSize(QSize(theme.px(CELL), theme.px(CELL)))
         self._list.setGridSize(QSize(CELL + 22, CELL + 46))
         self._list.setSpacing(6)
         self._list.setWordWrap(True)

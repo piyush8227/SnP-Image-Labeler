@@ -113,12 +113,12 @@ def main():
     if icon is not None:
         app.setWindowIcon(icon)      # window, taskbar and every dialog
 
-    qss_path = _resource("style.qss")
-    try:
-        with open(qss_path, "r", encoding="utf-8") as fh:
-            app.setStyleSheet(fh.read())
-    except OSError:
-        pass
+    # Theme + UI scale from the saved config, before the window is built so it
+    # never flashes up unstyled.
+    from core.config_manager import ConfigManager
+    from core import theme
+    settings = ConfigManager()
+    theme.apply(app, settings.ui_theme, settings.ui_scale)
 
     from main_window import MainWindow
     window = MainWindow()
