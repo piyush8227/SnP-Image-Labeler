@@ -1186,6 +1186,10 @@ class MainWindow(QMainWindow):
         Walk a folder on a worker thread behind a cancellable progress dialog.
         Returns the image paths, or None when the user cancelled.
         """
+        if self._scanner is not None:
+            self._set_status("A folder scan is already running.")
+            return None
+
         progress = QProgressDialog(
             f"Scanning {folder}…", "Cancel", 0, 0, self)
         progress.setWindowTitle("Importing")
@@ -1203,19 +1207,31 @@ class MainWindow(QMainWindow):
         progress.canceled.connect(scanner.cancel)
 
         self._scanner = scanner
-        scanner.start()
-        while scanner.isRunning():
-            QApplication.processEvents()
-            scanner.wait(30)
-        QApplication.processEvents()          # let the queued done signal land
-        progress.close()
-        self._scanner = None
+        try:
+            scanner.start()
+            while scanner.isRunning():
+                QApplication.processEvents()
+                scanner.wait(30)
+            QApplication.processEvents()      # let the queued done signal land
 
-        paths = result.get("paths", [])
-        if progress.wasCanceled():
+            # Read the flag BEFORE closing. QProgressDialog.close() emits
+            # canceled() on the way out, which flips wasCanceled() to true for
+            # every scan - reading it afterwards throws away a good result and
+            # makes folder import look like it silently does nothing.
+            cancelled = progress.wasCanceled()
+        finally:
+            try:
+                progress.canceled.disconnect()
+            except TypeError:
+                pass                          # nothing was connected
+            progress.close()
+            progress.deleteLater()
+            self._scanner = None
+
+        if cancelled:
             self._set_status("Import cancelled.")
             return None
-        return paths
+        return result.get("paths", [])
 
     def _enqueue(self, paths: List[str]):
         self._dup_action = None
