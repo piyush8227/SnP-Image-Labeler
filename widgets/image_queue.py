@@ -20,6 +20,8 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QMenu, QPushButton, QVBoxLayout, QWidget,
 )
 
+from core import theme
+
 from core.thumbnail_cache import ThumbnailService
 
 # Row states
@@ -146,7 +148,7 @@ class ImageQueuePanel(QWidget):
 
         self._btn_clear = QPushButton("Clear")
         self._btn_clear.setObjectName("queue_clear_btn")
-        self._btn_clear.setFixedHeight(22)
+        self._btn_clear.setMinimumHeight(theme.px(22))
         self._btn_clear.setToolTip("Clear entire image queue")
         self._btn_clear.setEnabled(False)
         self._btn_clear.clicked.connect(lambda _: self.clear_all_requested.emit())
@@ -169,7 +171,7 @@ class ImageQueuePanel(QWidget):
         self._filter_combo.addItems(
             [FILTER_ALL, FILTER_PENDING, FILTER_DONE, FILTER_FLAGGED]
         )
-        self._filter_combo.setFixedHeight(22)
+        self._filter_combo.setMinimumHeight(theme.px(22))
         self._filter_combo.setToolTip("Show only rows in this state")
         self._filter_combo.currentTextChanged.connect(self._on_filter_changed)
         cf.addWidget(self._filter_combo)
@@ -177,13 +179,21 @@ class ImageQueuePanel(QWidget):
 
         self._list = QListWidget()
         self._list.setObjectName("image_list")
-        self._list.setIconSize(QSize(THUMB_SIZE, THUMB_SIZE))
+        self._list.setIconSize(QSize(theme.px(THUMB_SIZE), theme.px(THUMB_SIZE)))
         self._list.setSpacing(1)
-        # Long-queue settings: uniform rows let the view lay out 50k items
-        # without measuring each one, and batched layout keeps it responsive.
+        # Uniform rows are what make a 50k queue cheap: the view derives every
+        # row's position arithmetically instead of measuring each one, so a
+        # single-pass layout is already O(1) in geometry work.
+        #
+        # Batched layout must NOT be used with it. Batched lays the view out
+        # 'batch size' items at a time on a timer, and anything that
+        # invalidates the layout - marking a row done, a status refresh -
+        # restarts it from item 0. While it catches up the scrollbar range
+        # collapses to a single batch, which threw the queue back to the top
+        # mid-session and made the lower rows unreachable: dragging past the
+        # first batch simply snapped back.
         self._list.setUniformItemSizes(True)
-        self._list.setLayoutMode(QListView.Batched)
-        self._list.setBatchSize(120)
+        self._list.setLayoutMode(QListView.SinglePass)
         self._list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self._list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list.currentRowChanged.connect(self._on_row_changed)
