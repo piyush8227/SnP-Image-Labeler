@@ -22,6 +22,9 @@ a = Analysis(
         # Bundle the icons (icon.ico is also the exe resource below)
         (str(HERE / 'icon.png'), '.'),
         (str(HERE / 'icon.ico'), '.'),
+        # GPL-3.0 section 4 requires a copy of the licence to travel with
+        # every copy of the program, so it ships inside the exe too.
+        (str(HERE / 'LICENSE'), '.'),
     ],
     hiddenimports=[
         # PyQt5 modules that PyInstaller may miss

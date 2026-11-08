@@ -635,6 +635,23 @@ Any examples, filenames, labels, schemas, or workflows shown in the documentatio
 
 ---
 
+## License
+
+This project is licensed under the **GNU General Public License v3.0 or later**.
+The full text is in [LICENSE](LICENSE).
+
+GPL-3.0 is not an arbitrary choice here. The application is built on **PyQt5**,
+which Riverbank Computing dual-licenses under the GNU GPL v3 and a commercial
+licence, and which -- unlike Qt itself -- is *not* available under the LGPL.
+Releasing a PyQt5 application publicly under a permissive licence such as MIT
+would advertise freedoms that cannot be granted without a commercial Riverbank
+licence, so the project adopts the licence its dependency already requires.
+
+In short: you are free to use, study, modify and redistribute this software,
+provided derivative works remain under the GPL-3.0 and carry the same notice.
+
+---
+
 ## Author
 
 **Piyush More**
