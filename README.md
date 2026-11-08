@@ -66,14 +66,10 @@ The annotation workflow supports configurable image metadata together with bound
 ### Features
 
 * Import individual images, multiple images, or complete directories
-* Runtime-configurable telemetry fields
-* Text inputs
-* Dropdown fields
-* Checkboxes
-* Radio buttons
-* Boolean fields
-* Bounding-box drawing and editing
-* Bounding-box labels
+* Managed label list, defined once and reused across the dataset
+* Multiple bounding boxes per image, each independently labelled
+* Bounding-box drawing, moving and resizing from any of the four corners
+* High-contrast box rendering that stays legible over any photograph
 * Undo / Redo
 * Autosave
 * Existing-label pre-fill
@@ -88,13 +84,13 @@ The annotation workflow supports configurable image metadata together with bound
 ```text
 Import Images
       ↓
-Configure Fields
+Define Labels
       ↓
 Review Image
       ↓
-Add Metadata
+Draw Bounding Boxes
       ↓
-Draw Bounding Box
+Assign a Label to Each Box
       ↓
 Validate / Flag
       ↓
@@ -112,25 +108,32 @@ Each image can produce an independent structured annotation file.
 ```json
 {
   "image_name": "Image_1.jpg",
-  "Category": "Example",
-  "Severity": "High",
-  "object_bounding_box": {
-    "left": 12.0,
-    "top": 30.0,
-    "right": 220.0,
-    "bottom": 180.0
-  }
+  "boxes": [
+    {"label": "currency", "left": 12.0, "top": 30.0, "right": 220.0, "bottom": 180.0},
+    {"label": "document", "left": 240.0, "top": 60.0, "right": 400.0, "bottom": 210.0}
+  ]
 }
 ```
 
 ### CSV
 
+The box list is written as a single JSON cell, so the file stays one row per image.
+
 ```csv
-image_name,Category,Severity,object_bounding_box
-Image_1.jpg,Example,High,"{""left"":12.0,""top"":30.0,""right"":220.0,""bottom"":180.0}"
+image_name,boxes
+Image_1.jpg,"[{""label"":""currency"",""left"":12.0,""top"":30.0,""right"":220.0,""bottom"":180.0}]"
 ```
 
-The schema is configurable, allowing the same application to support different dataset requirements.
+The label set is defined per project, allowing the same application to support
+different dataset requirements.
+
+### Reading Files Written by Earlier Versions
+
+Label files that use the older single `currency_country_bounding_box` key still
+open, with their box and label intact, in both the JSON and CSV forms. Nothing
+on disk is rewritten until that image is saved again, at which point it is
+written in the schema above. Field names from an older configuration are
+carried over as the starting label list on first run.
 
 ---
 
@@ -268,6 +271,33 @@ This makes the tool suitable for iterative labeling rather than one-pass annotat
 
 ---
 
+# Interface
+
+### Theme
+
+The application ships a light (white/black) theme and a dark theme, switchable
+from the status bar or with `Ctrl+Shift+D`. Colours are not written into the
+stylesheet: `style.qss` is a template of named tokens resolved per theme by
+`core/theme.py`, which is also where the painting code -- bounding boxes,
+thumbnails, the review grid -- reads its colours, so the two cannot drift apart.
+
+### Interface Scale
+
+The whole interface scales from 75% to 300%, applied live, from the status bar
+or `Ctrl+Shift+` `+` / `-`. One setting moves text, padding, borders, thumbnails
+and bounding-box handles together. Widget sizes are derived from the scale
+rather than hard-coded, so panels grow with their text instead of clipping it.
+
+### Menu Bar
+
+Every command is reachable from the menu bar -- **File**, **Edit**, **View**,
+**Task**, **Tools**, **Help** -- regardless of interface scale, because pop-up
+menus size themselves to their contents. The toolbar below it carries the
+frequently used actions and mirrors the same command definitions, so a command
+has a single state wherever it appears.
+
+---
+
 # Engineering Highlights
 
 The project was designed as more than a basic PyQt labeling interface.
@@ -386,6 +416,7 @@ snp_labeler/
 │   ├── rejection_manager.py
 │   ├── segregation_manager.py
 │   ├── session_store.py
+│   ├── theme.py
 │   ├── thumbnail_cache.py
 │   └── undo_stack.py
 │
@@ -393,12 +424,11 @@ snp_labeler/
 │   ├── image_viewer.py
 │   ├── annotation_viewer.py
 │   ├── image_queue.py
-│   ├── telemetry_panel.py
+│   ├── label_panel.py
 │   ├── bbox_panel.py
 │   ├── review_grid.py
 │   ├── segregation_panel.py
 │   ├── duplicate_scan_dialog.py
-│   ├── field_editor.py
 │   └── class_editor.py
 │
 ├── tests/
@@ -472,6 +502,9 @@ python main.py
 | `Ctrl+D`    | Find duplicates      |
 | `Shift+Del` | Reject current image |
 | `Enter`     | Assign and continue  |
+| `1` - `9`   | Quick label / split  |
+| `Ctrl+Shift+D` | Toggle dark theme |
+| `Ctrl+Shift+` `+` / `-` | Interface scale up / down |
 
 ---
 

@@ -76,8 +76,7 @@ def main():
     seed = cfg_mod.ConfigManager()
     seed.set("output_directory", str(out))
     seed.set("resume_session", False)
-    seed.telemetry_fields = [{"name": "denomination", "type": "Text Input",
-                              "options": []}]
+    seed.annotation_labels = ["currency", "document"]
 
     print(f"\nGenerating {N_BIG} images at {BIG_W}x{BIG_H} ({BIG_W*BIG_H/1e6:.0f} MP)…")
     master = tmp / "master.jpg"
