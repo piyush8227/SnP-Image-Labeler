@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+# Bumped when a saved config needs rewriting rather than just new keys merged in.
+#   2 - annotation moved from typed telemetry fields to a label list, and from
+#       one box per image to many, so a stored max of 1 is no longer a default.
+CONFIG_VERSION = 2
+
+
 class ConfigManager:
     """
     Configuration manager with:
@@ -44,14 +50,52 @@ class ConfigManager:
         "zoom_locked": False,                 # keep zoom/pan across images
         "annotation_sticky_label": False,     # reuse last label, skip the dialog
         "annotation_recent_labels": [],       # quick-pick list (most recent first)
-        "annotation_max_boxes": 1,            # boxes allowed per image
+        "annotation_max_boxes": 0,            # boxes per image (0 = unlimited)
+        "annotation_labels": [],              # the label (class) list for boxes
         "image_cache_mb": 384,                # full-res pixmap cache budget
         "resume_session": True,               # offer to restore the last queue
+        # -- Appearance -------------------------------------------------
+        "ui_theme": "light",                  # "light" | "dark"
+        "ui_scale": 1.0,                      # 0.5 - 4.0; scales text and spacing
+        # config_version is deliberately NOT defaulted here: _load_config merges
+        # defaults under the saved file, so a default would hide every old config
+        # from _migrate. It is stamped by _migrate instead.
     }
 
     def __init__(self):
         self.APP_DIR.mkdir(parents=True, exist_ok=True)
         self._config: Dict[str, Any] = self._load_config()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """
+        Bring a config written by an older build up to CONFIG_VERSION.
+
+        Only values whose meaning changed are touched; everything the user
+        deliberately set is left alone.
+        """
+        try:
+            version = int(self._config.get("config_version", 1))
+        except (TypeError, ValueError):
+            version = 1
+        if version >= CONFIG_VERSION:
+            return
+
+        if version < 2:
+            # "1 box per image" was the old default, not a considered choice.
+            # Annotation now takes several labelled boxes, so release the cap.
+            if int(self._config.get("annotation_max_boxes", 1) or 1) <= 1:
+                self._config["annotation_max_boxes"] = 0
+            # Field names become the starting label list (see annotation_labels).
+            if not self._config.get("annotation_labels"):
+                legacy = self._config.get("telemetry_fields") or []
+                names = [str(f.get("name", "")).strip() for f in legacy
+                         if isinstance(f, dict) and str(f.get("name", "")).strip()]
+                if names:
+                    self._config["annotation_labels"] = names
+
+        self._config["config_version"] = CONFIG_VERSION
+        self.save()
 
     # ------------------------------------------------------------------ #
     #  Internal                                                            #
@@ -138,10 +182,60 @@ class ConfigManager:
 
     @property
     def annotation_max_boxes(self) -> int:
+        """Boxes allowed per image; 0 means no limit."""
         try:
-            return max(1, int(self._config.get("annotation_max_boxes", 1)))
+            return max(0, int(self._config.get("annotation_max_boxes", 0)))
         except (TypeError, ValueError):
-            return 1
+            return 0
+
+    @property
+    def annotation_labels(self) -> List[str]:
+        """
+        The label (class) list offered for bounding boxes.
+
+        Migrates the old typed telemetry fields on first run: their names become
+        labels, so an existing config does not come up empty.
+        """
+        labels = self._config.get("annotation_labels")
+        if labels:
+            return [str(l) for l in labels]
+        legacy = self._config.get("telemetry_fields") or []
+        return [str(f.get("name", "")).strip() for f in legacy
+                if isinstance(f, dict) and str(f.get("name", "")).strip()]
+
+    @annotation_labels.setter
+    def annotation_labels(self, labels: List[str]) -> None:
+        seen, clean = set(), []
+        for label in labels or []:
+            text = str(label).strip()
+            if text and text.lower() not in seen:
+                seen.add(text.lower())
+                clean.append(text)
+        self.set("annotation_labels", clean)
+
+    @property
+    def ui_theme(self) -> str:
+        value = str(self._config.get("ui_theme", "light")).lower()
+        return value if value in ("light", "dark") else "light"
+
+    @ui_theme.setter
+    def ui_theme(self, mode: str) -> None:
+        self.set("ui_theme", "dark" if str(mode).lower() == "dark" else "light")
+
+    @property
+    def ui_scale(self) -> float:
+        try:
+            return max(0.5, min(4.0, float(self._config.get("ui_scale", 1.0))))
+        except (TypeError, ValueError):
+            return 1.0
+
+    @ui_scale.setter
+    def ui_scale(self, scale: float) -> None:
+        try:
+            value = max(0.5, min(4.0, float(scale)))
+        except (TypeError, ValueError):
+            value = 1.0
+        self.set("ui_scale", round(value, 4))
 
     @property
     def image_cache_mb(self) -> int:

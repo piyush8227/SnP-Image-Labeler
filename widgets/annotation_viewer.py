@@ -21,13 +21,15 @@ from typing import Dict, List, Optional
 
 from PyQt5.QtCore import QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (
-    QBrush, QColor, QFont, QPainter, QPainterPath, QPen,
+    QBrush, QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen,
 )
 from PyQt5.QtWidgets import (
     QDialog, QDialogButtonBox, QGraphicsItem, QGraphicsObject,
     QGraphicsRectItem, QGraphicsView, QGridLayout, QLabel, QLineEdit,
     QPushButton, QVBoxLayout,
 )
+
+from core import theme
 
 from widgets.image_viewer import ImageViewer
 
@@ -45,12 +47,51 @@ class ViewerMode(Enum):
 #  Label colour palette                                                #
 # ------------------------------------------------------------------ #
 
-LABEL_COLORS = [
-    QColor('#89b4fa'), QColor('#a6e3a1'), QColor('#fab387'),
-    QColor('#f38ba8'), QColor('#cba6f7'), QColor('#94e2d5'),
-    QColor('#f9e2af'), QColor('#74c7ec'), QColor('#eba0ac'),
-    QColor('#b4befe'),
-]
+# Filled in by set_chrome(); the defaults are the light-theme set so an import
+# before any theme is applied still draws something sane.
+LABEL_COLORS = [QColor(c) for c in theme.box_colors(theme.LIGHT)]
+
+
+class _Chrome:
+    """
+    Shared drawing constants for every box on screen.
+
+    A bounding box sits on an arbitrary photograph, so its outline cannot rely
+    on the theme background for contrast the way the rest of the UI can. Every
+    stroke is therefore drawn twice - a dark halo underneath a bright colour -
+    which stays readable over white paper, dark cloth and busy texture alike.
+    """
+
+    halo   = QColor("#000000")        # outline under every stroke
+    handle = QColor("#ffffff")        # grab-point fill
+    rim    = QColor("#000000")        # grab-point outline
+    ui_scale = 1.0                    # so handles grow with the UI scale
+
+    PEN_PX        = 2.0               # bright stroke, in SCREEN pixels
+    HALO_PX       = 5.0               # dark stroke under it
+    CORNER_PX     = 11.0              # corner grab-point, screen pixels
+    EDGE_PX       = 9.0               # mid-edge grab-point
+    TAG_PAD_PX    = 4.0
+
+
+CHROME = _Chrome()
+
+
+def set_chrome(mode: str, scale: float = 1.0) -> None:
+    """Point the box painter at a theme's palette. Called by the viewer."""
+    global LABEL_COLORS
+    LABEL_COLORS = [QColor(c) for c in theme.box_colors(mode)]
+    CHROME.halo     = QColor(theme.color(mode, "box_halo"))
+    CHROME.handle   = QColor(theme.color(mode, "box_handle"))
+    CHROME.rim      = QColor(theme.color(mode, "box_handle_rim"))
+    CHROME.ui_scale = theme.clamp_scale(scale)
+
+
+def _readable_on(color: QColor) -> QColor:
+    """Black or white, whichever stays legible on `color`."""
+    r, g, b = color.red(), color.green(), color.blue()
+    luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+    return QColor("#000000") if luminance > 0.6 else QColor("#ffffff")
 
 
 # ------------------------------------------------------------------ #
@@ -81,7 +122,7 @@ class LabelDialog(QDialog):
             for i, lbl in enumerate(existing_labels[:12]):
                 caption = f"{i + 1}  {lbl}" if i < 9 else lbl
                 btn = QPushButton(caption)
-                btn.setFixedHeight(26)
+                btn.setMinimumHeight(theme.px(26))
                 btn.clicked.connect(
                     lambda _, l=lbl: (self._edit.setText(l), self.accept())
                 )
@@ -113,6 +154,79 @@ class LabelDialog(QDialog):
 
     def get_label(self) -> str:
         return self._edit.text().strip()
+
+
+# ------------------------------------------------------------------ #
+#  Label tag — a child item that ignores the view transform            #
+# ------------------------------------------------------------------ #
+
+class TagItem(QGraphicsItem):
+    """
+    The label chip pinned to a box's top-left corner.
+
+    It carries ItemIgnoresTransformations, so it is laid out and painted in
+    screen pixels no matter how far the image is zoomed. Drawing the text
+    inside BoxItem.paint() instead would scale it with the scene: illegibly
+    small when zoomed out, and a wall of text when zoomed in.
+    """
+
+    def __init__(self, parent: "BoxItem"):
+        super().__init__(parent)
+        self._text  = ""
+        self._color = QColor("#ffffff")
+        self.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        self.setZValue(3)
+        # Decoration only. The chip overhangs the box's top-left corner, so if
+        # it answered hit tests it would swallow the clicks meant for that
+        # corner handle and the viewer would start drawing a new box instead
+        # of resizing the one under the cursor.
+        self.setAcceptedMouseButtons(Qt.NoButton)
+        self.setAcceptHoverEvents(False)
+
+    def shape(self) -> QPainterPath:
+        return QPainterPath()          # empty: never the answer to itemAt()
+
+    def set_tag(self, text: str, color: QColor):
+        if text == self._text and QColor(color) == self._color:
+            return
+        self.prepareGeometryChange()
+        self._text  = text or ""
+        self._color = QColor(color)
+        self.setVisible(bool(self._text))
+        self.update()
+
+    def _font(self) -> QFont:
+        font = QFont("Segoe UI")
+        font.setPointSizeF(max(6.0, 8.0 * CHROME.ui_scale))
+        font.setBold(True)
+        return font
+
+    def _size(self):
+        fm  = QFontMetricsF(self._font())
+        pad = max(3.0, CHROME.TAG_PAD_PX * CHROME.ui_scale)
+        return (fm.horizontalAdvance(self._text) + pad * 3.0, fm.height() + pad)
+
+    def boundingRect(self) -> QRectF:
+        if not self._text:
+            return QRectF()
+        w, h = self._size()
+        # Sits just above the corner it is anchored to.
+        return QRectF(-1, -h - 1, w + 2, h + 2)
+
+    def paint(self, painter: QPainter, option, widget):
+        if not self._text:
+            return
+        w, h = self._size()
+        rect = QRectF(0, -h, w, h)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(CHROME.halo)))
+        painter.drawRect(rect.adjusted(-1, -1, 1, 1))
+        painter.setBrush(QBrush(self._color))
+        painter.drawRect(rect)
+        painter.setFont(self._font())
+        painter.setPen(QPen(_readable_on(self._color)))
+        painter.drawText(rect, Qt.AlignCenter, self._text)
 
 
 # ------------------------------------------------------------------ #
@@ -165,6 +279,8 @@ class BoxItem(QGraphicsObject):
         )
         self.setAcceptHoverEvents(True)
         self.setZValue(1)
+        self._tag = TagItem(self)
+        self._sync_tag(self._color)
 
     # ---- Geometry -------------------------------------------------------
 
@@ -177,17 +293,66 @@ class BoxItem(QGraphicsObject):
     def set_bounds(self, bounds: Optional[QRectF]):
         self._bounds = QRectF(bounds) if bounds is not None else None
 
+    def view_k(self) -> float:
+        """
+        Scene units per screen pixel.
+
+        Chrome is specified in screen pixels and divided by the zoom, so a
+        handle is the same easy-to-hit size whether the image is at 10% or 800%.
+        Before this, handle size and pen width were scene units: zoomed out, the
+        outline thinned to nothing and the corners became un-grabbable.
+        """
+        scene = self.scene()
+        views = scene.views() if scene is not None else []
+        if views:
+            m11 = views[0].transform().m11()
+            if m11 > 1e-9:
+                return 1.0 / m11
+        return 1.0
+
+    def refresh_chrome(self):
+        """Re-measure after a zoom change; boundingRect depends on view_k()."""
+        self.prepareGeometryChange()
+        self.update()
+
     def boundingRect(self) -> QRectF:
-        m = self.HANDLE_SIZE + 4
-        return self._rect.adjusted(-m, -m, m, m)
+        k = self.view_k()
+        # Room for the halo, the grab-points and the label tag above the box.
+        side = (CHROME.CORNER_PX * CHROME.ui_scale + CHROME.HALO_PX) * k
+        top  = side + self._tag_height(k)
+        return self._rect.adjusted(-side, -top, side, side)
 
     def shape(self) -> QPainterPath:
         path = QPainterPath()
+        # Winding, not the odd-even default: each handle rect straddles the
+        # box edge, and under odd-even the overlap counts as OUTSIDE - which
+        # punched a hole through the inner half of every grab-point and made
+        # corners fail hit testing exactly where they look most clickable.
+        path.setFillRule(Qt.WindingFill)
         path.addRect(self._rect)
-        if self.isSelected():
-            for r in self._handle_rects().values():
-                path.addRect(r)
+        for r in self._handle_rects(active_only=True).values():
+            path.addRect(r)
         return path
+
+    def detach(self):
+        """
+        Tear the label chip down before this box is dropped.
+
+        The chip is a child item, so C++ deletes it with its parent - but the
+        Python wrapper in self._tag would outlive that and leave a dangling
+        reference for the next paint or garbage collection to trip over, which
+        aborts the interpreter rather than raising. Unparent it first.
+        """
+        tag, self._tag = self._tag, None
+        if tag is None:
+            return
+        try:
+            tag.setParentItem(None)
+            scene = tag.scene()
+            if scene is not None:
+                scene.removeItem(tag)
+        except RuntimeError:
+            pass                      # already gone with a scene.clear()
 
     def set_color(self, color: QColor):
         self._color = QColor(color)
@@ -200,29 +365,54 @@ class BoxItem(QGraphicsObject):
 
     # ---- Handles --------------------------------------------------------
 
-    def _handle_rects(self) -> Dict[int, QRectF]:
-        r  = self._rect
-        hs = self.HANDLE_SIZE / 2
+    CORNERS = (0, 2, 5, 7)          # TL, TR, BL, BR
+
+    def _handle_rects(self, active_only: bool = False) -> Dict[int, QRectF]:
+        """
+        The eight grab-points, sized in screen pixels.
+
+        The four corners are always present - they are what "see all four
+        points of the box" means, and they stay draggable without selecting the
+        box first. The mid-edge handles appear once the box is selected, so an
+        unselected box is not covered in chrome.
+        """
+        r = self._rect
+        k = self.view_k()
+        corner = CHROME.CORNER_PX * CHROME.ui_scale * k
+        edge   = CHROME.EDGE_PX   * CHROME.ui_scale * k
         cx, cy = r.center().x(), r.center().y()
-        s = self.HANDLE_SIZE
-        return {
-            self.TL: QRectF(r.left() - hs,  r.top() - hs,    s, s),
-            self.TM: QRectF(cx - hs,        r.top() - hs,    s, s),
-            self.TR: QRectF(r.right() - hs, r.top() - hs,    s, s),
-            self.ML: QRectF(r.left() - hs,  cy - hs,         s, s),
-            self.MR: QRectF(r.right() - hs, cy - hs,         s, s),
-            self.BL: QRectF(r.left() - hs,  r.bottom() - hs, s, s),
-            self.BM: QRectF(cx - hs,        r.bottom() - hs, s, s),
-            self.BR: QRectF(r.right() - hs, r.bottom() - hs, s, s),
+
+        def sq(x: float, y: float, size: float) -> QRectF:
+            h = size / 2.0
+            return QRectF(x - h, y - h, size, size)
+
+        rects = {
+            self.TL: sq(r.left(),  r.top(),    corner),
+            self.TR: sq(r.right(), r.top(),    corner),
+            self.BL: sq(r.left(),  r.bottom(), corner),
+            self.BR: sq(r.right(), r.bottom(), corner),
         }
+        if self.isSelected() or not active_only:
+            rects.update({
+                self.TM: sq(cx,        r.top(),    edge),
+                self.BM: sq(cx,        r.bottom(), edge),
+                self.ML: sq(r.left(),  cy,         edge),
+                self.MR: sq(r.right(), cy,         edge),
+            })
+        return rects
 
     def _handle_at(self, pos: QPointF) -> Optional[int]:
-        if not self.isSelected():
-            return None
-        for hid, hr in self._handle_rects().items():
+        """Corners respond always; mid-edges only on a selected box."""
+        for hid, hr in self._handle_rects(active_only=True).items():
             if hr.contains(pos):
                 return hid
         return None
+
+    def _tag_height(self, k: float) -> float:
+        """Scene-space room to reserve above the box for the screen-space tag."""
+        if not self.label:
+            return 0.0
+        return (14.0 * CHROME.ui_scale + CHROME.TAG_PAD_PX * 2) * k
 
     # ---- Hover ----------------------------------------------------------
 
@@ -337,37 +527,82 @@ class BoxItem(QGraphicsObject):
     # ---- Paint ----------------------------------------------------------
 
     def paint(self, painter: QPainter, option, widget):
+        """
+        Draw the box so it reads over any photograph.
+
+        Every stroke goes down twice: a dark halo first, the label colour on
+        top. That is what makes the outline survive both a white banknote and a
+        dark background - a single pastel stroke (the old behaviour) disappeared
+        into either one. All widths are screen pixels divided by the zoom, so
+        the outline never thins out or turns into a slab.
+        """
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, False)
 
-        fill = QColor(self._color)
-        fill.setAlpha(35)
-        painter.setBrush(QBrush(fill))
+        k        = self.view_k()
+        selected = self.isSelected()
+        color    = QColor(self._color)
 
-        border_color = QColor(self._color)
-        pen_style = Qt.DashLine if self.isSelected() else Qt.SolidLine
-        painter.setPen(QPen(border_color, 2, pen_style))
+        pen_w  = CHROME.PEN_PX  * CHROME.ui_scale * k
+        halo_w = CHROME.HALO_PX * CHROME.ui_scale * k
+        if selected:
+            pen_w  *= 1.5
+            halo_w *= 1.4
+
+        # Interior tint: light enough to keep the object readable underneath.
+        fill = QColor(color)
+        fill.setAlpha(48 if selected else 30)
+        painter.setBrush(QBrush(fill))
+        painter.setPen(Qt.NoPen)
         painter.drawRect(self._rect)
 
-        if self.label:
-            font = QFont("Segoe UI", 8, QFont.Bold)
-            painter.setFont(font)
-            fm = painter.fontMetrics()
-            tw = fm.horizontalAdvance(self.label) + 10
-            th = fm.height() + 4
-            tag_rect = QRectF(self._rect.left(), self._rect.top() - th,
-                              max(tw, 40), th)
-            painter.fillRect(tag_rect, border_color)
-            painter.setPen(QPen(QColor('#1e1e2e')))
-            painter.drawText(tag_rect, Qt.AlignCenter, self.label)
+        # Halo, then the bright stroke over it.
+        painter.setBrush(Qt.NoBrush)
+        halo = QColor(CHROME.halo)
+        halo.setAlpha(170)
+        painter.setPen(QPen(halo, halo_w, Qt.SolidLine, Qt.SquareCap, Qt.MiterJoin))
+        painter.drawRect(self._rect)
+        painter.setPen(QPen(color, pen_w, Qt.SolidLine, Qt.SquareCap, Qt.MiterJoin))
+        painter.drawRect(self._rect)
 
-        if self.isSelected():
-            painter.setPen(QPen(QColor('#1e1e2e'), 1))
-            painter.setBrush(QBrush(QColor('#ffffff')))
-            for hr in self._handle_rects().values():
-                painter.drawRect(hr)
+        # A dashed inner line marks the selected box without hiding the edge.
+        if selected:
+            inset = pen_w
+            painter.setPen(QPen(QColor(CHROME.handle), pen_w * 0.6, Qt.DashLine))
+            painter.drawRect(self._rect.adjusted(inset, inset, -inset, -inset))
 
+        self._sync_tag(color)
+        self._paint_handles(painter, k)
         painter.restore()
+
+    def _sync_tag(self, color: QColor):
+        """Keep the screen-space label chip on the box's top-left corner."""
+        if self._tag is None:
+            return
+        try:
+            self._tag.set_tag(self.label, color)
+            self._tag.setPos(self._rect.topLeft())
+        except RuntimeError:
+            self._tag = None          # detached underneath us; stop drawing it
+
+    def _paint_handles(self, painter: QPainter, k: float):
+        """Grab-points: a rimmed square so they show on any background."""
+        rim = QPen(QColor(CHROME.rim), max(1.0 * k, 0.5))
+        painter.setPen(rim)
+        corners = self._handle_rects(active_only=True)
+        for hid, hr in corners.items():
+            # Corners carry the label colour so the box they belong to is
+            # obvious when several overlap; mid-edges stay neutral.
+            painter.setBrush(QBrush(QColor(CHROME.handle)
+                                    if hid not in self.CORNERS else self._color))
+            painter.drawRect(hr)
+            if hid in self.CORNERS:
+                inner = hr.adjusted(hr.width() * 0.3, hr.height() * 0.3,
+                                    -hr.width() * 0.3, -hr.height() * 0.3)
+                painter.setBrush(QBrush(QColor(CHROME.handle)))
+                painter.setPen(Qt.NoPen)
+                painter.drawRect(inner)
+                painter.setPen(rim)
 
 
 # ------------------------------------------------------------------ #
@@ -397,7 +632,8 @@ class AnnotationViewer(ImageViewer):
         self._mode: ViewerMode = ViewerMode.NAVIGATE
         self._boxes: Dict[str, BoxItem] = {}
         self._label_colors: Dict[str, QColor] = {}
-        self._max_boxes = 1
+        self._max_boxes = 0          # 0 = unlimited
+        self._label_choices: List[str] = []
 
         # Label entry behaviour
         self._recent_labels: List[str] = []
@@ -407,6 +643,10 @@ class AnnotationViewer(ImageViewer):
         # Drawing state
         self._draw_start:   Optional[QPointF] = None
         self._preview_item: Optional[QGraphicsRectItem] = None
+        self._preview_halo: Optional[QGraphicsRectItem] = None
+        # Box chrome is sized in screen pixels, so it must be re-measured
+        # whenever the zoom changes or handles drift from the corners.
+        self.zoom_changed.connect(lambda *_: self._refresh_box_chrome())
         self._pending_boxes: List[dict] = []
 
         self._scene.selectionChanged.connect(self._on_selection_changed)
@@ -443,7 +683,81 @@ class AnnotationViewer(ImageViewer):
             box.setFlag(QGraphicsItem.ItemIsSelectable, on)
 
     def set_max_boxes(self, n: int):
-        self._max_boxes = max(1, int(n))
+        """0 (or less) means no limit - annotation allows many labelled boxes."""
+        try:
+            self._max_boxes = max(0, int(n))
+        except (TypeError, ValueError):
+            self._max_boxes = 0
+
+    def at_box_limit(self) -> bool:
+        return self._max_boxes > 0 and len(self._boxes) >= self._max_boxes
+
+    def apply_theme(self, mode: str, scale: float = 1.0):
+        """
+        Re-colour the box chrome and every live box for a new theme/scale.
+
+        The order matters. Chrome sizes come from CHROME.ui_scale, so changing
+        it silently changes what every BoxItem.boundingRect() returns.
+        QGraphicsScene keeps a spatial index keyed on those rectangles and only
+        refreshes it when prepareGeometryChange() is called BEFORE the geometry
+        moves - calling set_chrome() first left the index holding rectangles
+        that no longer matched their items, and the stale entries brought the
+        process down when those items were later removed.
+        """
+        for box in self._boxes.values():
+            box.prepareGeometryChange()          # while the old scale still holds
+
+        set_chrome(mode, scale)
+
+        self.setBackgroundBrush(QBrush(QColor(theme.color(mode, "canvas"))))
+        self._label_colors.clear()
+        for box in self._boxes.values():
+            box.set_color(self._label_color(box.label))
+        self._refresh_box_chrome()
+        self.viewport().update()
+
+    def _refresh_box_chrome(self):
+        """Boxes size their chrome from the zoom, so re-measure after one."""
+        for box in self._boxes.values():
+            box.refresh_chrome()
+
+    # ---- Zoom: warn the scene index before the geometry moves -----------
+    #
+    # Box chrome is specified in screen pixels, so every BoxItem.boundingRect()
+    # depends on the view transform. Changing that transform therefore changes
+    # their bounding rectangles - and QGraphicsScene's spatial index has to be
+    # told BEFORE it happens, not after, or it keeps entries that no longer
+    # match their items. Stale entries abort the process when the item is later
+    # removed. Every zoom path goes through one of these three.
+
+    def _warn_geometry_change(self):
+        for box in self._boxes.values():
+            try:
+                box.prepareGeometryChange()
+            except RuntimeError:
+                pass
+
+    def scale(self, sx, sy):
+        self._warn_geometry_change()
+        super().scale(sx, sy)
+        self._refresh_box_chrome()
+
+    def setTransform(self, matrix, combine=False):
+        self._warn_geometry_change()
+        super().setTransform(matrix, combine)
+        self._refresh_box_chrome()
+
+    def resetTransform(self):
+        self._warn_geometry_change()
+        super().resetTransform()
+        self._refresh_box_chrome()
+
+    def _next_box_color(self) -> QColor:
+        """The colour the box currently being dragged out will receive."""
+        sticky = getattr(self, "_sticky_label", "") or ""
+        if sticky:
+            return self._label_color(sticky)
+        return LABEL_COLORS[len(self._boxes) % len(LABEL_COLORS)]
 
     # ---- Label behaviour ------------------------------------------------
 
@@ -460,8 +774,22 @@ class AnnotationViewer(ImageViewer):
     def sticky_label(self) -> str:
         return self._sticky_label
 
+    def set_label_choices(self, labels: List[str]):
+        """
+        The managed label list from the config.
+
+        These lead the quick-pick so annotators reach for the project's agreed
+        labels first; anything already used on screen is still offered after.
+        """
+        self._label_choices = [str(l) for l in labels if str(l).strip()]
+        for index, label in enumerate(self._label_choices):
+            self._label_color(label)        # stable colour per label, in order
+
     def existing_labels(self) -> List[str]:
-        seen = list(self._recent_labels)
+        seen = list(getattr(self, "_label_choices", []))
+        for lbl in self._recent_labels:
+            if lbl and lbl not in seen:
+                seen.append(lbl)
         for lbl in self._label_colors:
             if lbl and lbl not in seen:
                 seen.append(lbl)
@@ -559,6 +887,7 @@ class AnnotationViewer(ImageViewer):
     def clear_boxes(self, silent: bool = False):
         for box in list(self._boxes.values()):
             try:
+                box.detach()
                 if box.scene() is not None:
                     self._scene.removeItem(box)
             except RuntimeError:
@@ -610,6 +939,7 @@ class AnnotationViewer(ImageViewer):
         removed = 0
         for item in list(self._scene.selectedItems()):
             if isinstance(item, BoxItem):
+                item.detach()
                 self._scene.removeItem(item)
                 self._boxes.pop(item.box_id, None)
                 self.box_deleted.emit(item.box_id)
@@ -622,6 +952,7 @@ class AnnotationViewer(ImageViewer):
         box = self._boxes.pop(box_id, None)
         if box:
             try:
+                box.detach()
                 self._scene.removeItem(box)
             except RuntimeError:
                 pass
@@ -737,18 +1068,34 @@ class AnnotationViewer(ImageViewer):
             return
 
         if self._pixmap_item and self._pixmap_item.boundingRect().contains(scene_pos):
-            if len(self._boxes) >= self._max_boxes:
+            if self.at_box_limit():
                 self._show_toast(
-                    f"Max {self._max_boxes} bounding box per image.\n"
-                    "Delete the existing box first (Del)."
+                    f"Max {self._max_boxes} bounding box(es) per image."
+                    "  Delete one first (Del)."
                 )
                 event.accept()
                 return
             self._draw_start = scene_pos
+            k = 1.0 / max(self.transform().m11(), 1e-9)
+            accent = QColor(self._next_box_color())
+            # Halo under the preview too: dragging a box out over a bright
+            # banknote used to leave an almost invisible pale-blue outline.
+            self._preview_halo = QGraphicsRectItem(QRectF(scene_pos, scene_pos))
+            halo = QColor(CHROME.halo)
+            halo.setAlpha(170)
+            self._preview_halo.setPen(
+                QPen(halo, CHROME.HALO_PX * CHROME.ui_scale * k,
+                     Qt.SolidLine, Qt.SquareCap, Qt.MiterJoin))
+            # QPainter takes the Qt.NoBrush enum; a QGraphicsItem does not.
+            self._preview_halo.setBrush(QBrush(Qt.NoBrush))
+            self._preview_halo.setZValue(98)
+            self._scene.addItem(self._preview_halo)
+
             self._preview_item = QGraphicsRectItem(QRectF(scene_pos, scene_pos))
-            self._preview_item.setPen(QPen(QColor('#89b4fa'), 2, Qt.DashLine))
-            fill = QColor('#89b4fa')
-            fill.setAlpha(25)
+            self._preview_item.setPen(
+                QPen(accent, CHROME.PEN_PX * CHROME.ui_scale * k, Qt.DashLine))
+            fill = QColor(accent)
+            fill.setAlpha(40)
             self._preview_item.setBrush(QBrush(fill))
             self._preview_item.setZValue(99)
             self._scene.addItem(self._preview_item)
@@ -774,9 +1121,12 @@ class AnnotationViewer(ImageViewer):
 
             try:
                 self._scene.removeItem(self._preview_item)
+                if self._preview_halo is not None:
+                    self._scene.removeItem(self._preview_halo)
             except RuntimeError:
                 pass
             self._preview_item = None
+            self._preview_halo = None
             self._draw_start   = None
             self._readout.hide()
 
@@ -829,9 +1179,12 @@ class AnnotationViewer(ImageViewer):
             if self._preview_item:
                 try:
                     self._scene.removeItem(self._preview_item)
+                    if self._preview_halo is not None:
+                        self._scene.removeItem(self._preview_halo)
                 except RuntimeError:
                     pass
                 self._preview_item = None
+                self._preview_halo = None
                 self._draw_start = None
                 self._readout.hide()
             self._scene.clearSelection()
